@@ -44,6 +44,8 @@ pub struct Opened {
     pub base_len: usize,
     pub pages: Vec<PageInfo>,
     pub annots: Vec<Annot>,
+    /// Older ViDF annotations that became part of the original.
+    pub stale: usize,
     pub warning: Option<String>,
     pub stamp: Stamp,
 }
@@ -170,10 +172,14 @@ pub fn open(path: &Path) -> Result<Opened, String> {
         return Err("encrypted PDFs are not supported".into());
     }
     let (base_len, annots, stale) = own_update(&full, &bytes)?;
-    let warning = (stale > 0).then(|| {
-        let s = if stale == 1 { "" } else { "s" };
-        format!("{stale} older ViDF annotation{s} can no longer be changed: another program modified the file")
-    });
+    let mut warnings = Vec::new();
+    if stale > 0 {
+        warnings.push(stale_warning(stale));
+    }
+    if !can_annotate(&bytes[..base_len]) {
+        warnings.push("this PDF is damaged, so ViDF cannot save annotations to it".to_string());
+    }
+    let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
     let doc = if base_len == bytes.len() {
         full
     } else {
@@ -185,7 +191,24 @@ pub fn open(path: &Path) -> Result<Opened, String> {
         let b = doc.load_page(i).map_err(err)?.bounds().map_err(err)?;
         pages.push(PageInfo { size: Vec2::new(b.x1 - b.x0, b.y1 - b.y0), origin: Vec2::new(b.x0, b.y0) });
     }
-    Ok(Opened { doc, base_len, pages, annots, warning, stamp: Stamp::of(&bytes) })
+    Ok(Opened { doc, base_len, pages, annots, stale, warning, stamp: Stamp::of(&bytes) })
+}
+
+fn stale_warning(n: usize) -> String {
+    let s = if n == 1 { "" } else { "s" };
+    format!("{n} older ViDF annotation{s} can no longer be changed: another program modified the file")
+}
+
+/// Whether annotations can be saved after `base`. MuPDF repairs a damaged
+/// file when it first loads a broken object, which may be long after
+/// opening it, and cannot save it incrementally after that; so load every
+/// object now, as saving would. That takes about 4 ms for 3600 objects.
+fn can_annotate(base: &[u8]) -> bool {
+    let Ok(doc) = PdfDocument::from_bytes(base) else { return false };
+    for num in 1..doc.xref_len().unwrap_or(0) {
+        let _ = doc.xref_object(num as i32);
+    }
+    doc.can_be_saved_incrementally()
 }
 
 /// Renders `page` at `scale` pixels per point into tightly packed RGBA.
@@ -377,7 +400,7 @@ pub fn clear(path: &Path) -> Result<(usize, Option<String>), String> {
     if !o.annots.is_empty() {
         save(path, o.base_len, &[], &mut o.stamp)?;
     }
-    Ok((o.annots.len(), o.warning))
+    Ok((o.annots.len(), (o.stale > 0).then(|| stale_warning(o.stale))))
 }
 
 #[cfg(test)]
@@ -618,11 +641,17 @@ mod tests {
         for (skew, ok) in [(0, true), (7, false)] {
             fs::write(&path, classic_pdf(skew)).unwrap();
             let mut opened = open(&path).unwrap();
+            assert_eq!(opened.warning.is_none(), ok);
             assert_eq!(save(&path, opened.base_len, &[note("x")], &mut opened.stamp).is_ok(), ok);
             if !ok {
                 assert_eq!(fs::read(&path).unwrap(), classic_pdf(skew));
             }
         }
+        // A wrong startxref is repaired at once.
+        let pdf = String::from_utf8(classic_pdf(0)).unwrap();
+        let (head, tail) = pdf.rsplit_once("startxref\n").unwrap();
+        fs::write(&path, format!("{head}startxref\n1{tail}")).unwrap();
+        assert!(open(&path).unwrap().warning.is_some());
         fs::remove_dir_all(&dir).unwrap();
     }
 
