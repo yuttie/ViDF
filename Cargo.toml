@@ -26,6 +26,7 @@ bevy = { version = "0.20", default-features = false, features = [
     "bevy_ui",
     "bevy_ui_render",
 ] }
+glam = "0.33"
 mupdf = { version = "0.8", default-features = false, features = ["base14-fonts"] }
 
 [features]

@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use bevy::math::Vec2;
+use crate::geom::Vec2;
 use mupdf::color::AnnotationColor;
 use mupdf::pdf::{PdfAnnotationType, PdfDocument, PdfObject, PdfWriteOptions};
 use mupdf::{Colorspace, Matrix, TextPageFlags};
@@ -285,7 +285,7 @@ pub fn save(path: &Path, base_len: usize, annots: &[Annot]) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bevy::math::Vec2;
+    use crate::geom::Vec2;
 
     /// Path of a small sample PDF; set `VIDF_TEST_PDF` to override.
     fn sample() -> Option<PathBuf> {

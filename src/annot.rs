@@ -1,6 +1,6 @@
 //! Annotations made in ViDF, independent of how they are stored in the PDF.
 
-use bevy::math::{Rect, Vec2};
+use crate::geom::{Rect, Vec2};
 
 use crate::text::Quad;
 

@@ -1,6 +1,6 @@
 //! Modal, Vim-like editing state: keys in, cursor/annotation/view changes out.
 
-use bevy::math::{Rect, Vec2};
+use crate::geom::{Rect, Vec2};
 
 use crate::annot::{note_rect, swatch_by_key, swatch_by_name, Annot, AnnotKind, NOTE_SIZE, PALETTE};
 use crate::pdf::PageInfo;

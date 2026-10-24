@@ -4,7 +4,7 @@
 //! logical pixels: a page point maps to `zoom` world units, and world y
 //! grows upwards as in Bevy.
 
-use bevy::math::{Rect, Vec2};
+use crate::geom::{Rect, Vec2};
 
 use crate::pdf::PageInfo;
 
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn ensure_visible_scrolls_minimally() {
         let mut v = view();
-        let r = v.rect_to_world(1, Rect::new(10.0, 100.0, 20.0, 110.0));
+        let r = v.rect_to_world(1, Rect::from_corners(Vec2::new(10.0, 100.0), Vec2::new(20.0, 110.0)));
         v.ensure_visible(r, 20.0);
         let view = v.viewport();
         assert!((view.min.y - (r.min.y - 20.0)).abs() < 1e-3);

@@ -2,7 +2,7 @@
 //!
 //! All coordinates are MuPDF page coordinates in points (y grows downwards).
 
-use bevy::math::{Rect, Vec2};
+use crate::geom::{Rect, Vec2};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Quad {

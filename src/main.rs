@@ -1,6 +1,7 @@
 mod annot;
 mod app;
 mod editor;
+mod geom;
 mod pdf;
 mod text;
 mod view;
