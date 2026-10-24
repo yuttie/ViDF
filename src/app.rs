@@ -35,6 +35,8 @@ struct Viewer {
     ed: Editor,
     worker: Worker,
     opened: bool,
+    /// Set once ViDF itself decided to close the window.
+    quitting: bool,
     pages: Vec<PageTexture>,
     /// Set when the document cannot be opened; reported after the window closes.
     failure: Arc<Mutex<Option<String>>>,
@@ -62,6 +64,7 @@ pub fn run(path: PathBuf) -> Result<(), String> {
                 ed: Editor::default(),
                 worker,
                 opened: false,
+                quitting: false,
                 pages: Vec::new(),
                 failure: fail,
                 #[cfg(feature = "e2e")]
@@ -149,7 +152,7 @@ impl Viewer {
                 }
                 Response::Failed(e) if !self.opened => {
                     *self.failure.lock().unwrap() = Some(e);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.quit(ctx);
                 }
                 Response::Failed(e) => self.ed.message = e,
             }
@@ -161,6 +164,11 @@ impl Viewer {
         self.apply(ctx, fx);
     }
 
+    fn quit(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
     fn apply(&mut self, ctx: &egui::Context, effects: Vec<Effect>) {
         for fx in effects {
             match fx {
@@ -168,7 +176,7 @@ impl Viewer {
                     let annots = self.ed.annots.clone();
                     let _ = self.worker.tx.send(Request::Save { annots });
                 }
-                Effect::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Effect::Quit => self.quit(ctx),
                 Effect::Yank(text) => {
                     if let Err(e) = yank(text) {
                         self.ed.message = e;
@@ -285,6 +293,14 @@ impl Viewer {
 }
 
 impl eframe::App for Viewer {
+    /// Also runs while the window is hidden, unlike `ui`.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Closing the window from outside, or with egui's shortcut.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting && !self.ed.may_close() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_worker(&ctx);
@@ -405,7 +421,7 @@ mod e2e {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(callback));
                 script.stage = 2;
             }
-            2 if script.done.load(Ordering::SeqCst) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            2 if script.done.load(Ordering::SeqCst) => v.quit(ctx),
             _ => {}
         }
     }

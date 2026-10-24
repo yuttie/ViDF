@@ -111,6 +111,15 @@ impl Editor {
         self.annots != self.saved
     }
 
+    /// Whether the window may close when asked by something other than a
+    /// command, such as the window manager.
+    pub fn may_close(&mut self) -> bool {
+        if self.dirty() {
+            self.message = "unsaved annotations (:w to write, :q! to discard)".into();
+        }
+        !self.dirty()
+    }
+
     /// Takes the outcome of an `Effect::Save`: the annotations written,
     /// which may differ from the current ones by now.
     pub fn saved(&mut self, result: Result<Vec<Annot>, String>) -> Vec<Effect> {
@@ -951,6 +960,15 @@ mod tests {
         for cmd in ["ZZ", ":x\n", ":wq\n"] {
             assert_eq!(keys(&mut e, cmd), vec![Effect::Quit], "{cmd:?}");
         }
+    }
+
+    #[test]
+    fn window_close_guards_unsaved_changes() {
+        let mut e = editor();
+        assert!(e.may_close());
+        keys(&mut e, "vea");
+        assert!(!e.may_close());
+        assert!(e.status().0.starts_with("unsaved annotations"));
     }
 
     #[test]
