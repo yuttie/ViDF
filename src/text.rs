@@ -23,10 +23,26 @@ impl Quad {
         Rect::from_corners(min, max)
     }
 
-    /// The quad spanning from the left edge of `a` to the right edge of `b`,
-    /// which follows the text direction even when the text is rotated.
-    pub fn span(a: &Quad, b: &Quad) -> Quad {
-        Quad { ul: a.ul, ll: a.ll, ur: b.ur, lr: b.lr }
+    /// The smallest quad covering all of `quads` that runs along the first
+    /// one, so it follows the text direction even when the text is rotated.
+    /// Raised or lowered glyphs, such as superscripts, make it taller
+    /// rather than slanting its edges.
+    pub fn enclosing<'a>(quads: impl IntoIterator<Item = &'a Quad>) -> Option<Quad> {
+        let mut quads = quads.into_iter().peekable();
+        let first = **quads.peek()?;
+        let along = (first.ur - first.ul).try_normalize().unwrap_or(Vec2::X);
+        let across = along.perp();
+        let (mut lo, mut hi) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
+        for q in quads {
+            for c in [q.ul, q.ur, q.ll, q.lr] {
+                let d = c - first.ul;
+                let local = Vec2::new(d.dot(along), d.dot(across));
+                lo = lo.min(local);
+                hi = hi.max(local);
+            }
+        }
+        let at = |s: f32, t: f32| first.ul + along * s + across * t;
+        Some(Quad { ul: at(lo.x, lo.y), ur: at(hi.x, lo.y), ll: at(lo.x, hi.y), lr: at(hi.x, hi.y) })
     }
 }
 
@@ -379,7 +395,7 @@ impl DocText {
         self.for_line_pieces(a, b, |page, t, s, e| {
             let vis = |i: &usize| !t.glyphs[*i].c.is_whitespace();
             let (Some(s), Some(e)) = ((s..=e).find(vis), (s..=e).rev().find(vis)) else { return };
-            out.push((page, Quad::span(&t.glyphs[s].quad, &t.glyphs[e].quad)));
+            out.extend(Quad::enclosing(t.glyphs[s..=e].iter().map(|g| &g.quad)).map(|q| (page, q)));
         });
         out
     }
@@ -512,6 +528,24 @@ mod tests {
         assert_eq!(q.len(), 2);
         assert_eq!(q[0].1.ul, Vec2::new(20.0, 0.0));
         assert_eq!(q[0].1.ur, Vec2::new(55.0, 0.0));
+    }
+
+    #[test]
+    fn highlights_cover_raised_glyphs() {
+        let v = Vec2::new;
+        let glyph = |c, x: f32, top: f32, bottom: f32| Glyph {
+            c,
+            quad: Quad { ul: v(x, top), ur: v(x + 5.0, top), ll: v(x, bottom), lr: v(x + 5.0, bottom) },
+        };
+        // "x²", as with a footnote marker at the end of a line.
+        let mut t = PageText::default();
+        t.push_line(0, [glyph('x', 0.0, 2.0, 10.0), glyph('2', 5.0, 0.0, 5.0)]);
+        let d = DocText { pages: vec![Some(t)] };
+        let q = d.line_quads(p(0, 0), p(0, 1));
+        assert_eq!(q[0].1, Quad { ul: v(0.0, 0.0), ur: v(10.0, 0.0), ll: v(0.0, 10.0), lr: v(10.0, 10.0) });
+        // Text rotated to run down the page keeps its orientation.
+        let down = Quad { ul: v(10.0, 0.0), ur: v(10.0, 5.0), ll: v(2.0, 0.0), lr: v(2.0, 5.0) };
+        assert_eq!(Quad::enclosing([&down]), Some(down));
     }
 
     #[test]

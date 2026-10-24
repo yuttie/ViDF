@@ -427,7 +427,7 @@ mod tests {
         let mut opened = open(&path).unwrap();
         assert!(opened.annots.is_empty());
         let text = extract_text(&opened.doc, 0).unwrap();
-        let quad = Quad::span(&text.glyphs[0].quad, &text.glyphs[3].quad);
+        let quad = Quad::enclosing(text.glyphs[..4].iter().map(|g| &g.quad)).unwrap();
         let annots = vec![
             Annot { page: 0, color: [1.0, 0.89, 0.2], kind: AnnotKind::Highlight { quads: vec![quad] } },
             note("needs a citation"),
