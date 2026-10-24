@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::geom::Vec2;
 use mupdf::color::AnnotationColor;
 use mupdf::pdf::{PdfAnnotationType, PdfDocument, PdfObject, PdfWriteOptions};
-use mupdf::{Colorspace, Matrix, TextPageFlags};
+use mupdf::{Buffer, Colorspace, Matrix, TextPageFlags};
 
 use crate::annot::{note_rect, Annot, AnnotKind};
 use crate::text::{Glyph, PageText, Quad};
@@ -203,8 +203,10 @@ fn fill_note_background(annot: &PdfObject) -> Result<(), String> {
     }
     let [r, g, bl] = NOTE_FILL;
     let fill = format!("q {r} {g} {bl} rg {} {} {} {} re f Q\n", b[0], b[1], b[2] - b[0], b[3] - b[1]);
-    let content = String::from_utf8_lossy(&ap.read_stream().map_err(err)?).into_owned();
-    ap.write_stream_string(&(fill + &content)).map_err(err)
+    // The stream holds text in the font's encoding, which is not UTF-8.
+    let mut content = fill.into_bytes();
+    content.extend(ap.read_stream().map_err(err)?);
+    ap.write_stream_buffer(&Buffer::from_bytes(&content).map_err(err)?).map_err(err)
 }
 
 fn tmp_path(path: &Path) -> PathBuf {
@@ -295,16 +297,30 @@ mod tests {
         p.exists().then_some(p)
     }
 
-    #[test]
-    fn save_and_clear_round_trip() {
+    /// A copy of the sample PDF in a directory of its own.
+    fn scratch(test: &str) -> Option<(PathBuf, PathBuf)> {
         let Some(src) = sample() else {
             eprintln!("no sample PDF; skipping");
-            return;
+            return None;
         };
-        let dir = std::env::temp_dir().join(format!("vidf-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vidf-test-{}-{test}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("paper.pdf");
         fs::copy(&src, &path).unwrap();
+        Some((dir, path))
+    }
+
+    fn note(text: &str) -> Annot {
+        Annot {
+            page: 0,
+            color: [0.8, 0.1, 0.1],
+            kind: AnnotKind::Note { at: Vec2::new(50.0, 60.0), text: text.into(), size: 9.0 },
+        }
+    }
+
+    #[test]
+    fn save_and_clear_round_trip() {
+        let Some((dir, path)) = scratch("round-trip") else { return };
         let original = fs::read(&path).unwrap();
 
         let opened = open(&path).unwrap();
@@ -313,11 +329,7 @@ mod tests {
         let quad = Quad::span(&text.glyphs[0].quad, &text.glyphs[3].quad);
         let annots = vec![
             Annot { page: 0, color: [1.0, 0.89, 0.2], kind: AnnotKind::Highlight { quads: vec![quad] } },
-            Annot {
-                page: 0,
-                color: [0.8, 0.1, 0.1],
-                kind: AnnotKind::Note { at: Vec2::new(50.0, 60.0), text: "needs a citation".into(), size: 9.0 },
-            },
+            note("needs a citation"),
         ];
         save(&path, opened.base_len, &annots).unwrap();
         drop(opened);
@@ -346,6 +358,26 @@ mod tests {
         // Clearing restores the original bytes.
         save(&path, original.len(), &[]).unwrap();
         assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn other_viewers_show_non_ascii_notes() {
+        let Some((dir, path)) = scratch("non-ascii") else { return };
+        let opened = open(&path).unwrap();
+        let text = "café “quoted” – naïve";
+        save(&path, opened.base_len, &[note(text)]).unwrap();
+        // Run the page with its annotations, as any viewer draws it.
+        let full = PdfDocument::open(path.to_str().unwrap()).unwrap();
+        let list = full.load_page(0).unwrap().to_display_list(true).unwrap();
+        let tp = list.to_text_page(TextPageFlags::empty()).unwrap();
+        let mut shown = String::new();
+        for block in tp.blocks() {
+            for line in block.lines() {
+                shown.extend(line.chars().filter_map(|c| c.char()));
+            }
+        }
+        assert!(shown.contains(text), "{text:?} not drawn; got {:?}", &shown[shown.len().saturating_sub(80)..]);
         fs::remove_dir_all(&dir).unwrap();
     }
 
