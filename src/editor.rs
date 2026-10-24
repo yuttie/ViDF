@@ -716,7 +716,7 @@ impl Editor {
         match name {
             "" => {}
             "w" => fx.push(Effect::Save),
-            "q" if self.dirty() => self.message = "unsaved annotations (add ! to discard, or :wq)".into(),
+            "q" | "qa" if self.dirty() => self.message = "unsaved annotations (add ! to discard, or :wq)".into(),
             "q" | "q!" | "qa" | "qa!" => fx.push(Effect::Quit),
             "wq" | "x" => {
                 self.quit_after_save = true;
@@ -946,6 +946,7 @@ mod tests {
         let mut e = editor();
         keys(&mut e, "vea");
         assert!(keys(&mut e, ":q\n").is_empty());
+        assert!(keys(&mut e, ":qa\n").is_empty());
         assert_eq!(keys(&mut e, ":q!\n"), vec![Effect::Quit]);
     }
 }
