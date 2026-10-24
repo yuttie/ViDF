@@ -56,6 +56,12 @@ pub fn run(path: PathBuf) -> Result<(), String> {
         "ViDF",
         options,
         Box::new(move |cc| {
+            // Keys belong to the editor: egui would quit on Ctrl+Q and
+            // scale its whole UI on Ctrl+=, Ctrl+- and Ctrl+0.
+            cc.egui_ctx.options_mut(|o| {
+                o.quit_shortcuts.clear();
+                o.zoom_with_keyboard = false;
+            });
             let ctx = cc.egui_ctx.clone();
             let waker = Waker::default();
             let _ = waker.set(Box::new(move || ctx.request_repaint()));
