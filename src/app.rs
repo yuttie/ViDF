@@ -72,6 +72,8 @@ pub fn run(path: PathBuf) -> AppExit {
         .init_resource::<Drawn>()
         .add_systems(Startup, setup)
         .add_systems(Update, (poll_worker, keyboard, sync_view, request_renders, draw_overlay, draw_status).chain());
+    #[cfg(feature = "e2e")]
+    e2e::install(&mut app);
     app.run()
 }
 
@@ -385,3 +387,86 @@ fn draw_status(
     }
 }
 
+/// Scripted runs for end-to-end checks. Once the document is loaded, the
+/// keys in `VIDF_KEYS` are pressed (Vim notation such as `<Esc>`, `<CR>`,
+/// `<C-d>`), then the window is captured to `VIDF_SHOT` and the app exits.
+#[cfg(feature = "e2e")]
+mod e2e {
+    use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+
+    use super::*;
+
+    #[derive(Resource)]
+    struct Script {
+        keys: Vec<Key>,
+        shot: PathBuf,
+        frames: u32,
+        stage: u8,
+    }
+
+    fn parse(s: &str) -> Vec<Key> {
+        let mut out = Vec::new();
+        let mut rest = s;
+        while let Some(c) = rest.chars().next() {
+            if c == '<' {
+                if let Some(end) = rest.find('>') {
+                    let k = match &rest[1..end] {
+                        "Esc" => Some(Key::Esc),
+                        "CR" => Some(Key::Enter),
+                        "BS" => Some(Key::Backspace),
+                        "Space" => Some(Key::Char(' ')),
+                        n if n.starts_with("C-") && n.len() == 3 => n.chars().nth(2).map(Key::Ctrl),
+                        _ => None,
+                    };
+                    if let Some(k) = k {
+                        out.push(k);
+                        rest = &rest[end + 1..];
+                        continue;
+                    }
+                }
+            }
+            out.push(Key::Char(c));
+            rest = &rest[c.len_utf8()..];
+        }
+        out
+    }
+
+    pub fn install(app: &mut App) {
+        let (Ok(keys), Ok(shot)) = (std::env::var("VIDF_KEYS"), std::env::var("VIDF_SHOT")) else { return };
+        app.insert_resource(WinitSettings::game())
+            .insert_resource(Script { keys: parse(&keys), shot: shot.into(), frames: 0, stage: 0 })
+            .add_systems(Update, step.after(draw_status));
+    }
+
+    fn step(
+        mut commands: Commands,
+        mut script: ResMut<Script>,
+        mut ed: ResMut<Ed>,
+        backend: Res<Backend>,
+        pages: Query<&PageSprite>,
+        mut exit: MessageWriter<AppExit>,
+    ) {
+        let settled = backend.opened
+            && ed.text.pages.iter().all(Option::is_some)
+            && pages.iter().all(|p| p.requested.is_none());
+        script.frames += 1;
+        match script.stage {
+            0 if settled => {
+                for k in std::mem::take(&mut script.keys) {
+                    press(k, &mut ed, &backend, &mut exit);
+                }
+                script.stage = 1;
+                script.frames = 0;
+            }
+            1 if settled && script.frames > 5 => {
+                commands.spawn(Screenshot::primary_window()).observe(save_to_disk(script.shot.clone()));
+                script.stage = 2;
+                script.frames = 0;
+            }
+            2 if script.frames > 10 => {
+                exit.write(AppExit::Success);
+            }
+            _ => {}
+        }
+    }
+}

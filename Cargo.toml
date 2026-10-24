@@ -28,6 +28,10 @@ bevy = { version = "0.20", default-features = false, features = [
 ] }
 mupdf = { version = "0.8", default-features = false, features = ["base14-fonts"] }
 
+[features]
+# Scripted key input and screenshots for end-to-end checks.
+e2e = ["bevy/png"]
+
 [profile.dev]
 opt-level = 1
 
