@@ -372,10 +372,7 @@ impl Editor {
                 None => self.message = format!("no color '{c}'"),
             },
             ("d", Key::Char('d')) => self.delete_at_cursor(),
-            ("Z", Key::Char('Z')) => {
-                self.quit_after_save = true;
-                fx.push(Effect::Save);
-            }
+            ("Z", Key::Char('Z')) => self.write_quit(fx),
             ("Z", Key::Char('Q')) => fx.push(Effect::Quit),
             _ => {}
         }
@@ -711,6 +708,16 @@ impl Editor {
         self.changed();
     }
 
+    /// Writes, then quits; quits right away if there is nothing to write.
+    fn write_quit(&mut self, fx: &mut Vec<Effect>) {
+        if self.dirty() {
+            self.quit_after_save = true;
+            fx.push(Effect::Save);
+        } else {
+            fx.push(Effect::Quit);
+        }
+    }
+
     fn command(&mut self, cmd: &str, fx: &mut Vec<Effect>) {
         let (name, arg) = cmd.split_once(' ').map_or((cmd, ""), |(a, b)| (a, b.trim()));
         match name {
@@ -718,10 +725,7 @@ impl Editor {
             "w" => fx.push(Effect::Save),
             "q" | "qa" if self.dirty() => self.message = "unsaved annotations (add ! to discard, or :wq)".into(),
             "q" | "q!" | "qa" | "qa!" => fx.push(Effect::Quit),
-            "wq" | "x" => {
-                self.quit_after_save = true;
-                fx.push(Effect::Save);
-            }
+            "wq" | "x" => self.write_quit(fx),
             "clear" => {
                 if self.annots.is_empty() {
                     self.message = "no annotations".into();
@@ -939,6 +943,14 @@ mod tests {
         assert_eq!(keys(&mut e, ":wq\n"), vec![Effect::Save]);
         assert_eq!(e.saved(Ok(e.annots.clone())), vec![Effect::Quit]);
         assert!(!e.dirty());
+    }
+
+    #[test]
+    fn write_and_quit_skips_writing_when_unchanged() {
+        let mut e = editor();
+        for cmd in ["ZZ", ":x\n", ":wq\n"] {
+            assert_eq!(keys(&mut e, cmd), vec![Effect::Quit], "{cmd:?}");
+        }
     }
 
     #[test]
