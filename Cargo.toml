@@ -1,6 +1,24 @@
 [package]
-name = "ViDF"
+name = "vidf"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "default_fonts"] }
+glam = "0.33"
+mupdf = { version = "0.8", default-features = false, features = ["base14-fonts"] }
+
+[features]
+# Scripted key input and screenshots for end-to-end checks.
+e2e = []
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
