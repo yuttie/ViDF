@@ -52,6 +52,13 @@ impl View {
         Vec2::new((local.x - info.size.x / 2.0) * self.zoom, -(self.offsets[page] + local.y) * self.zoom)
     }
 
+    /// The point of `page` at world position `w`, which may be off the page.
+    pub fn to_page(&self, page: usize, w: Vec2) -> Vec2 {
+        let info = &self.pages[page];
+        let local = Vec2::new(w.x / self.zoom + info.size.x / 2.0, -w.y / self.zoom - self.offsets[page]);
+        local + info.origin
+    }
+
     /// The page under world position `w` (the nearest one in gaps) and the
     /// point on it.
     pub fn from_world(&self, w: Vec2) -> Option<(usize, Vec2)> {
@@ -61,8 +68,7 @@ impl View {
         let y = -w.y / self.zoom;
         let page = self.offsets.partition_point(|&o| o <= y).saturating_sub(1);
         let info = &self.pages[page];
-        let local = Vec2::new(w.x / self.zoom + info.size.x / 2.0, y - self.offsets[page]);
-        Some((page, local.min(info.size) + info.origin))
+        Some((page, self.to_page(page, w).min(info.origin + info.size)))
     }
 
     pub fn page_rect(&self, page: usize) -> Rect {

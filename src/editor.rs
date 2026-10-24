@@ -181,9 +181,13 @@ impl Editor {
         self.text.glyph(self.cursor).map_or(0.0, |g| g.quad.center().x)
     }
 
+    fn glyph_world(&self, p: Pos) -> Option<Rect> {
+        let g = self.text.glyph(p)?;
+        Some(self.view.rect_to_world(p.page, g.quad.bbox()))
+    }
+
     fn cursor_world(&self) -> Option<Rect> {
-        let g = self.text.glyph(self.cursor)?;
-        Some(self.view.rect_to_world(self.cursor.page, g.quad.bbox()))
+        self.glyph_world(self.cursor)
     }
 
     fn follow_cursor(&mut self) {
@@ -193,12 +197,24 @@ impl Editor {
         }
     }
 
-    /// Moves the cursor to the text nearest to the given viewport fraction.
+    /// Moves the cursor to the text on screen nearest to the given fraction
+    /// of the viewport height. With no text on screen, such as on a scanned
+    /// figure, the cursor stays where it is.
     fn cursor_to_screen(&mut self, fy: f32) {
         let v = self.view.viewport();
         let x = self.cursor_world().map_or(v.center().x, |r| r.center().x);
         let w = Vec2::new(x, v.max.y - v.height() * fy);
-        if let Some(p) = self.view.from_world(w).and_then(|(page, at)| self.text.nearest(page, at)) {
+        let candidates = (0..self.view.pages.len()).filter_map(|page| {
+            let r = self.view.page_rect(page);
+            if r.max.y < v.min.y || r.min.y > v.max.y {
+                return None;
+            }
+            // Page y grows downwards, world y upwards.
+            let (top, bottom) = (self.view.to_page(page, v.max).y, self.view.to_page(page, v.min).y);
+            let p = self.text.nearest_in(page, self.view.to_page(page, w), top, bottom)?;
+            Some(((self.glyph_world(p)?.center() - w).length(), p))
+        });
+        if let Some((_, p)) = candidates.min_by(|a, b| a.0.total_cmp(&b.0)) {
             self.cursor = p;
         }
     }
@@ -206,12 +222,10 @@ impl Editor {
     /// Scrolls by `by` world units and keeps the cursor at the same place on
     /// screen, like Vim's CTRL-D.
     fn scroll_with_cursor(&mut self, by: f32) {
-        let before = self.cursor_world().map(|r| r.center().y - self.view.center.y);
+        let v = self.view.viewport();
+        let f = self.cursor_world().map(|r| (v.max.y - r.center().y) / v.height());
         self.view.scroll(Vec2::new(0.0, by));
-        if let Some(off) = before {
-            let v = self.view.viewport();
-            self.cursor_to_screen((v.max.y - (self.view.center.y + off)) / v.height());
-        }
+        self.cursor_to_screen(f.filter(|f| (0.0..=1.0).contains(f)).unwrap_or(0.5));
     }
 
     /// Cursor motions shared by normal and visual mode.
@@ -220,6 +234,8 @@ impl Editor {
         let n = self.count.unwrap_or(1);
         let repeat = |p: Pos, f: &dyn Fn(Pos) -> Pos| (0..n).fold(p, |p, _| f(p));
         let c = self.cursor;
+        // Commands that put the cursor on screen leave the view alone.
+        let mut follow = true;
         let new = match k {
             Key::Char('h') | Key::Left | Key::Backspace => repeat(c, &|p| t.char_back(p)),
             Key::Char('l') | Key::Right | Key::Char(' ') => repeat(c, &|p| t.char_fwd(p)),
@@ -264,6 +280,7 @@ impl Editor {
                     _ => h * 0.9,
                 };
                 self.scroll_with_cursor(by * n as f32);
+                follow = false;
                 self.cursor
             }
             Key::Char('H') | Key::Char('M') | Key::Char('L') => {
@@ -273,6 +290,7 @@ impl Editor {
                     _ => 0.9,
                 };
                 self.cursor_to_screen(f);
+                follow = false;
                 self.cursor
             }
             Key::Char('n') | Key::Char('N') => {
@@ -287,7 +305,9 @@ impl Editor {
         };
         self.count = None;
         self.cursor = new;
-        self.follow_cursor();
+        if follow {
+            self.follow_cursor();
+        }
         true
     }
 
@@ -857,23 +877,33 @@ mod tests {
     use super::*;
     use crate::text::Glyph;
 
-    fn editor() -> Editor {
+    fn sample_text() -> PageText {
+        let mut t = PageText::default();
+        for (li, s) in ["alpha beta gamma", "delta epsilon"].iter().enumerate() {
+            let y = 100.0 + li as f32 * 12.0;
+            t.push_line(0, s.chars().enumerate().map(|(i, c)| {
+                let x = 50.0 + i as f32 * 6.0;
+                let v = |x, y| Vec2::new(x, y);
+                Glyph { c, quad: Quad { ul: v(x, y), ur: v(x + 6.0, y), ll: v(x, y + 10.0), lr: v(x + 6.0, y + 10.0) } }
+            }));
+        }
+        t
+    }
+
+    /// Pages of 600x800pt in a 624x400 viewport; `text[i]` says whether
+    /// page `i` has the sample text or none, like a scanned figure.
+    fn editor_pages(text: &[bool]) -> Editor {
         let mut e = Editor::default();
         let page = PageInfo { size: Vec2::new(600.0, 800.0), origin: Vec2::ZERO };
-        e.open(vec![page; 2], vec![], Vec2::new(624.0, 400.0));
-        for p in 0..2 {
-            let mut t = PageText::default();
-            for (li, s) in ["alpha beta gamma", "delta epsilon"].iter().enumerate() {
-                let y = 100.0 + li as f32 * 12.0;
-                t.push_line(0, s.chars().enumerate().map(|(i, c)| {
-                    let x = 50.0 + i as f32 * 6.0;
-                    let v = |x, y| Vec2::new(x, y);
-                    Glyph { c, quad: Quad { ul: v(x, y), ur: v(x + 6.0, y), ll: v(x, y + 10.0), lr: v(x + 6.0, y + 10.0) } }
-                }));
-            }
-            e.set_text(p, t);
+        e.open(vec![page; text.len()], vec![], Vec2::new(624.0, 400.0));
+        for (p, &has_text) in text.iter().enumerate() {
+            e.set_text(p, if has_text { sample_text() } else { PageText::default() });
         }
         e
+    }
+
+    fn editor() -> Editor {
+        editor_pages(&[true, true])
     }
 
     /// One page with lines starting at the given points. Letters are 6pt
@@ -1035,6 +1065,33 @@ mod tests {
         assert_eq!(e.cursor.idx, 13);
         keys(&mut e, "]a");
         assert_eq!(e.cursor.idx, 18);
+    }
+
+    #[test]
+    fn scrolling_passes_pages_without_text() {
+        let mut e = editor_pages(&[true, false, true]);
+        for _ in 0..20 {
+            e.key(Key::Ctrl('f'));
+        }
+        assert_eq!(e.view.current_page(), 2);
+        assert_eq!(e.cursor.page, 2);
+        for _ in 0..20 {
+            e.key(Key::Ctrl('u'));
+        }
+        assert_eq!(e.view.current_page(), 0);
+        assert_eq!(e.cursor.page, 0);
+    }
+
+    #[test]
+    fn screen_lines_do_not_scroll() {
+        let mut e = editor();
+        e.view.set_zoom(4.0);
+        keys(&mut e, "gg");
+        let center = e.view.center;
+        for k in ["H", "L", "M", "H"] {
+            keys(&mut e, k);
+            assert_eq!(e.view.center, center, "{k}");
+        }
     }
 
     #[test]

@@ -327,20 +327,29 @@ impl DocText {
 
     /// The glyph nearest to point `at` on `page`, preferring the closest line.
     pub fn nearest(&self, page: usize, at: Vec2) -> Option<Pos> {
+        self.nearest_in(page, at, f32::MIN, f32::MAX)
+    }
+
+    /// Like `nearest`, among the lines whose middle is between `top` and
+    /// `bottom`.
+    pub fn nearest_in(&self, page: usize, at: Vec2, top: f32, bottom: f32) -> Option<Pos> {
         let t = self.page(page)?;
-        let line = (0..t.lines.len()).min_by(|&a, &b| {
-            let dist = |li: usize| {
-                let l = &t.lines[li];
-                let top = t.glyphs[l.start..l.end].iter().map(|g| g.quad.bbox().min.y).fold(f32::MAX, f32::min);
-                let bot = t.glyphs[l.start..l.end].iter().map(|g| g.quad.bbox().max.y).fold(f32::MIN, f32::max);
-                let dy = if at.y < top { top - at.y } else if at.y > bot { at.y - bot } else { 0.0 };
-                let l0 = t.glyphs[l.start].quad.bbox().min.x;
-                let l1 = t.glyphs[l.end - 1].quad.bbox().max.x;
-                let dx = if at.x < l0 { l0 - at.x } else if at.x > l1 { at.x - l1 } else { 0.0 };
-                dy * 4.0 + dx
-            };
-            dist(a).total_cmp(&dist(b))
-        })?;
+        let extent = |l: &Line| {
+            let glyphs = &t.glyphs[l.start..l.end];
+            let top = glyphs.iter().map(|g| g.quad.bbox().min.y).fold(f32::MAX, f32::min);
+            let bot = glyphs.iter().map(|g| g.quad.bbox().max.y).fold(f32::MIN, f32::max);
+            (top, bot, glyphs[0].quad.bbox().min.x, glyphs[glyphs.len() - 1].quad.bbox().max.x)
+        };
+        let dist = |(top, bot, l0, l1): (f32, f32, f32, f32)| {
+            let dy = if at.y < top { top - at.y } else if at.y > bot { at.y - bot } else { 0.0 };
+            let dx = if at.x < l0 { l0 - at.x } else if at.x > l1 { at.x - l1 } else { 0.0 };
+            dy * 4.0 + dx
+        };
+        let line = (0..t.lines.len())
+            .map(|li| (li, extent(&t.lines[li])))
+            .filter(|(_, e)| (top..=bottom).contains(&((e.0 + e.1) / 2.0)))
+            .min_by(|a, b| dist(a.1).total_cmp(&dist(b.1)))?
+            .0;
         Some(self.closest_in_line(page, line, at.x))
     }
 
