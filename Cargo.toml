@@ -1,6 +1,40 @@
 [package]
-name = "ViDF"
+name = "vidf"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bevy = { version = "0.20", default-features = false, features = [
+    "std",
+    "multi_threaded",
+    "async_executor",
+    "bevy_asset",
+    "bevy_log",
+    "bevy_winit",
+    "bevy_window",
+    "wayland",
+    "keyboard",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_camera",
+    "bevy_color",
+    "bevy_image",
+    "bevy_sprite",
+    "bevy_sprite_render",
+    "bevy_text",
+    "default_font",
+    "bevy_ui",
+    "bevy_ui_render",
+] }
+mupdf = { version = "0.8", default-features = false }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
