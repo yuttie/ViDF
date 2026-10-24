@@ -236,22 +236,25 @@ fn can_annotate(base: &[u8]) -> bool {
     doc.can_be_saved_incrementally()
 }
 
-/// Renders `page` at `scale` pixels per point into tightly packed RGBA.
-pub fn render(doc: &PdfDocument, page: usize, scale: f32) -> Result<(u32, u32, Vec<u8>), String> {
+/// Renders `page` at `scale` pixels per point, converting each RGB pixel
+/// with `pixel`, row by row from the top.
+pub fn render<P>(
+    doc: &PdfDocument,
+    page: usize,
+    scale: f32,
+    pixel: impl Fn([u8; 3]) -> P,
+) -> Result<(u32, u32, Vec<P>), String> {
     let p = doc.load_page(page as i32).map_err(err)?;
     let pix = p
         .to_pixmap(&Matrix::new_scale(scale, scale), &Colorspace::device_rgb(), false, true)
         .map_err(err)?;
     let (w, h, n) = (pix.width() as usize, pix.height() as usize, pix.n() as usize);
     let stride = pix.stride() as usize;
-    let samples = pix.samples();
-    let mut rgba = Vec::with_capacity(w * h * 4);
-    for row in samples.chunks(stride).take(h) {
-        for px in row[..w * n].chunks_exact(n) {
-            rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
-        }
+    let mut out = Vec::with_capacity(w * h);
+    for row in pix.samples().chunks(stride).take(h) {
+        out.extend(row[..w * n].chunks_exact(n).map(|px| pixel([px[0], px[1], px[2]])));
     }
-    Ok((w as u32, h as u32, rgba))
+    Ok((w as u32, h as u32, out))
 }
 
 pub fn extract_text(doc: &PdfDocument, page: usize) -> Result<PageText, String> {

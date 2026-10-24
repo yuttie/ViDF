@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use eframe::egui::{Color32, ColorImage};
+
 use crate::annot::Annot;
 use crate::pdf::{self, PageInfo};
 use crate::text::PageText;
@@ -20,7 +22,8 @@ pub enum Request {
 pub enum Response {
     Opened { pages: Vec<PageInfo>, annots: Vec<Annot>, warning: Option<String> },
     Text { page: usize, text: PageText },
-    Rendered { page: usize, scale: f32, width: u32, height: u32, rgba: Vec<u8> },
+    /// Built here rather than on the UI thread, which only uploads it.
+    Rendered { page: usize, scale: f32, image: ColorImage },
     /// The annotations written.
     Saved(Result<Vec<Annot>, String>),
     Failed(String),
@@ -95,8 +98,10 @@ fn run(path: PathBuf, rx: Receiver<Request>, send: impl Fn(Response) -> bool) {
             }
         }
         let resp = if let Some((page, scale)) = renders.pop_front() {
-            match pdf::render(&doc, page, scale) {
-                Ok((width, height, rgba)) => Response::Rendered { page, scale, width, height, rgba },
+            match pdf::render(&doc, page, scale, |[r, g, b]| Color32::from_rgb(r, g, b)) {
+                Ok((w, h, pixels)) => {
+                    Response::Rendered { page, scale, image: ColorImage::new([w as usize, h as usize], pixels) }
+                }
                 Err(e) => Response::Failed(format!("page {}: {e}", page + 1)),
             }
         } else if let Some(page) = texts.pop_front() {

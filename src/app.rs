@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{
-    self, Align2, Color32, ColorImage, Event, FontId, Key as EguiKey, Pos2, Shape as EShape, Stroke, TextureHandle,
+    self, Align2, Color32, Event, FontId, Key as EguiKey, Pos2, Shape as EShape, Stroke, TextureHandle,
     TextureOptions,
 };
 
@@ -152,7 +152,7 @@ impl Viewer {
                     self.opened = true;
                 }
                 Response::Text { page, text } => self.ed.set_text(page, text),
-                Response::Rendered { page, scale, width, height, rgba } => {
+                Response::Rendered { page, scale, image } => {
                     let Some(pt) = self.pages.get_mut(page) else { continue };
                     if pt.requested.is_none() {
                         // Cancelled while rendering; the page is no longer near the view.
@@ -161,7 +161,6 @@ impl Viewer {
                     if pt.requested == Some(scale) {
                         pt.requested = None;
                     }
-                    let image = ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
                     let tex = ctx.load_texture(format!("page-{page}"), image, TextureOptions::LINEAR);
                     pt.shown = Some((tex, scale));
                 }
@@ -368,6 +367,8 @@ mod tests {
 #[cfg(feature = "e2e")]
 mod e2e {
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    use eframe::egui::ColorImage;
 
     use super::*;
 
