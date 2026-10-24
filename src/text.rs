@@ -401,7 +401,8 @@ impl DocText {
     }
 
     /// Case-insensitive search for `needle`, starting after (or before) `from`.
-    /// Matches may span line breaks within a page. Wraps around the document.
+    /// Matches may span line breaks within a page, which read as a space, or
+    /// as nothing after a hyphen. Wraps around the document.
     pub fn search(&self, from: Pos, needle: &str, forward: bool) -> Option<(Pos, Pos)> {
         let needle: Vec<char> = needle.to_lowercase().chars().collect();
         if needle.is_empty() || self.pages.is_empty() {
@@ -411,18 +412,27 @@ impl DocText {
         let hits_on = |page: usize| -> Vec<(Pos, Pos)> {
             let Some(t) = self.page(page) else { return vec![] };
             // Flatten the page into chars with a glyph index for each.
-            let mut chars = Vec::with_capacity(t.glyphs.len());
+            let mut chars: Vec<Flat> = Vec::with_capacity(t.glyphs.len());
             for (i, g) in t.glyphs.iter().enumerate() {
-                if i > 0 && t.line_of[i] != t.line_of[i - 1] && !g.c.is_whitespace() {
-                    chars.push((' ', i - 1));
+                if i > 0 && t.line_of[i] != t.line_of[i - 1] {
+                    match chars.last_mut() {
+                        // Either hyphenated ("con-tinuous") or a real hyphen ("state-of-the-art").
+                        Some(last) if last.c == '-' => last.optional = true,
+                        Some(last) if !last.c.is_whitespace() && !g.c.is_whitespace() => {
+                            chars.push(Flat { c: ' ', glyph: i - 1, optional: false })
+                        }
+                        _ => {}
+                    }
                 }
-                chars.extend(g.c.to_lowercase().map(|c| (c, i)));
+                chars.extend(g.c.to_lowercase().map(|c| Flat { c, glyph: i, optional: false }));
             }
             let mut hits = Vec::new();
             for s in 0..chars.len() {
-                if chars[s..].iter().map(|c| c.0).take(needle.len()).eq(needle.iter().copied()) {
-                    let e = chars[s + needle.len() - 1].1;
-                    hits.push((Pos { page, idx: chars[s].1 }, Pos { page, idx: e }));
+                if chars[s].c != needle[0] {
+                    continue;
+                }
+                if let Some(end) = match_from(&chars, s + 1, &needle[1..]) {
+                    hits.push((Pos { page, idx: chars[s].glyph }, Pos { page, idx: chars[end - 1].glyph }));
                 }
             }
             hits
@@ -446,6 +456,26 @@ impl DocText {
         }
         None
     }
+}
+
+/// A character of a page flattened for searching.
+struct Flat {
+    c: char,
+    glyph: usize,
+    /// A hyphen before a line break, which a match may skip.
+    optional: bool,
+}
+
+/// The end of a match of `needle` that continues at `chars[at]`.
+fn match_from(chars: &[Flat], at: usize, needle: &[char]) -> Option<usize> {
+    let Some((&n, rest)) = needle.split_first() else { return Some(at) };
+    let c = chars.get(at)?;
+    if c.c == n
+        && let Some(end) = match_from(chars, at + 1, rest)
+    {
+        return Some(end);
+    }
+    if c.optional { match_from(chars, at + 1, needle) } else { None }
 }
 
 #[cfg(test)]
@@ -528,6 +558,15 @@ mod tests {
         assert_eq!(q.len(), 2);
         assert_eq!(q[0].1.ul, Vec2::new(20.0, 0.0));
         assert_eq!(q[0].1.ur, Vec2::new(55.0, 0.0));
+    }
+
+    #[test]
+    fn search_joins_line_breaks() {
+        let d = DocText { pages: vec![Some(page(&["foo ", "bar con-", "tinuous state-of-the-", "art"]))] };
+        assert_eq!(d.search(p(0, 0), "foo bar", true), Some((p(0, 0), p(0, 6))));
+        assert_eq!(d.search(p(0, 0), "continuous", true), Some((p(0, 8), p(0, 18))));
+        assert_eq!(d.search(p(0, 0), "con- tinuous", true), None);
+        assert_eq!(d.search(p(0, 0), "state-of-the-art", true), Some((p(0, 20), p(0, 35))));
     }
 
     #[test]
