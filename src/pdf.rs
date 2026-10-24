@@ -22,6 +22,7 @@ const BASE_KEY: &str = "ViDFBase";
 const NAME_PREFIX: &str = "vidf-";
 const AUTHOR: &str = "ViDF";
 const NOTE_FONT: &str = "Helv";
+const NOTE_FILL: [f32; 3] = [1.0, 1.0, 0.97];
 
 #[derive(Clone, Copy, Debug)]
 pub struct PageInfo {
@@ -189,6 +190,23 @@ pub fn extract_text(doc: &PdfDocument, page: usize) -> Result<PageText, String> 
     Ok(text)
 }
 
+/// MuPDF ignores /IC for FreeText, so paint an opaque box under the text
+/// ourselves; it keeps the note readable over body text in any viewer.
+fn fill_note_background(annot: &PdfObject) -> Result<(), String> {
+    let missing = || "note has no appearance stream".to_string();
+    let ap = annot.get_dict("AP").map_err(err)?.ok_or_else(missing)?;
+    let mut ap = ap.get_dict("N").map_err(err)?.ok_or_else(missing)?;
+    let bbox = ap.get_dict("BBox").map_err(err)?.ok_or_else(missing)?;
+    let mut b = [0.0; 4];
+    for (i, v) in b.iter_mut().enumerate() {
+        *v = bbox.get_array(i as i32).map_err(err)?.ok_or_else(missing)?.as_float().map_err(err)?;
+    }
+    let [r, g, bl] = NOTE_FILL;
+    let fill = format!("q {r} {g} {bl} rg {} {} {} {} re f Q\n", b[0], b[1], b[2] - b[0], b[3] - b[1]);
+    let content = String::from_utf8_lossy(&ap.read_stream().map_err(err)?).into_owned();
+    ap.write_stream_string(&(fill + &content)).map_err(err)
+}
+
 fn tmp_path(path: &Path) -> PathBuf {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     path.with_file_name(format!(".{name}.vidf-tmp"))
@@ -221,6 +239,8 @@ fn append_annots(tmp: &Path, base_len: usize, annots: &[Annot]) -> Result<(), St
                 an.set_contents(text).map_err(err)?;
                 an.set_default_appearance(NOTE_FONT, *size, Some(rgb(a.color))).map_err(err)?;
                 an.set_border_width(0.0).map_err(err)?;
+                // MuPDF adds a callout line when the rect is set; notes have none.
+                an.object().dict_delete("CL").map_err(err)?;
                 an
             }
         };
@@ -228,7 +248,12 @@ fn append_annots(tmp: &Path, base_len: usize, annots: &[Annot]) -> Result<(), St
         let mut obj = an.object();
         obj.dict_put("NM", PdfObject::new_string(&format!("{NAME_PREFIX}{i}")).map_err(err)?).map_err(err)?;
         obj.dict_put(BASE_KEY, base.try_clone().map_err(err)?).map_err(err)?;
-        an.update().map_err(err)?;
+        if !an.update().map_err(err)? {
+            return Err(format!("could not create the appearance of annotation {}", i + 1));
+        }
+        if let AnnotKind::Note { .. } = a.kind {
+            fill_note_background(&an.object())?;
+        }
     }
     drop(pages);
     let mut opts = PdfWriteOptions::default();
