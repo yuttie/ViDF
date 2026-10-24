@@ -18,17 +18,37 @@ pub struct Annot {
     pub kind: AnnotKind,
 }
 
-/// Width of a glyph relative to the font size, used to size note boxes.
-/// Generous enough for both Helvetica (in the PDF) and the UI font.
+/// Width of a glyph in the UI's monospace font, relative to the font size.
 const CHAR_WIDTH: f32 = 0.6;
 const LINE_HEIGHT: f32 = 1.25;
 pub const NOTE_PADDING: f32 = 2.0;
 pub const NOTE_SIZE: f32 = 9.0;
 
+/// Advance widths of Helvetica, the font of notes in the PDF, from the
+/// space to `~`, in thousandths of the font size.
+#[rustfmt::skip]
+const HELVETICA: [u16; 95] = [
+    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278,
+    556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556,
+    1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,
+    667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556,
+    333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556,
+    556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
+];
+
+/// Width of a line of note text relative to the font size: in the UI or
+/// in the PDF, whichever is wider. Other characters count as 1, as wide as
+/// the widest ones Helvetica has.
+fn line_width(line: &str) -> f32 {
+    let helvetica = |c: char| HELVETICA.get((c as usize).wrapping_sub(32)).map_or(1.0, |&w| f32::from(w) / 1000.0);
+    let pdf: f32 = line.chars().map(helvetica).sum();
+    pdf.max(line.chars().count() as f32 * CHAR_WIDTH)
+}
+
 pub fn note_rect(at: Vec2, text: &str, size: f32) -> Rect {
-    let cols = text.lines().map(|l| l.chars().count()).max().unwrap_or(0).max(1);
+    let width = text.lines().map(line_width).fold(CHAR_WIDTH, f32::max);
     let rows = text.lines().count().max(1) + usize::from(text.ends_with('\n'));
-    let w = cols as f32 * size * CHAR_WIDTH + 2.0 * NOTE_PADDING;
+    let w = width * size + 2.0 * NOTE_PADDING;
     let h = rows as f32 * size * LINE_HEIGHT + 2.0 * NOTE_PADDING;
     Rect::from_corners(at, at + Vec2::new(w, h))
 }
@@ -70,6 +90,15 @@ mod tests {
         assert!(b.width() > a.width());
         assert!(b.height() > a.height());
         assert_eq!(a.min, Vec2::ZERO);
+    }
+
+    #[test]
+    fn helvetica_widths_match_mupdf() {
+        let font = mupdf::Font::new("Helvetica").unwrap();
+        for (c, &w) in (' '..='~').zip(&HELVETICA) {
+            let advance = font.advance_glyph(font.encode_character(c as i32).unwrap()).unwrap();
+            assert!((advance - f32::from(w) / 1000.0).abs() < 0.002, "{c:?}: {advance}");
+        }
     }
 
     #[test]

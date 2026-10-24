@@ -464,23 +464,42 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The lines of text on page 0 as any viewer draws them, annotations
+    /// included.
+    fn shown_lines(path: &Path) -> Vec<String> {
+        let full = PdfDocument::open(path.to_str().unwrap()).unwrap();
+        let list = full.load_page(0).unwrap().to_display_list(true).unwrap();
+        let tp = list.to_text_page(TextPageFlags::empty()).unwrap();
+        let mut lines = Vec::new();
+        for block in tp.blocks() {
+            for line in block.lines() {
+                lines.push(line.chars().filter_map(|c| c.char()).collect());
+            }
+        }
+        lines
+    }
+
     #[test]
     fn other_viewers_show_non_ascii_notes() {
         let Some((dir, path)) = scratch("non-ascii") else { return };
         let mut opened = open(&path).unwrap();
         let text = "café “quoted” – naïve";
         save(&path, opened.base_len, &[note(text)], &mut opened.stamp).unwrap();
-        // Run the page with its annotations, as any viewer draws it.
-        let full = PdfDocument::open(path.to_str().unwrap()).unwrap();
-        let list = full.load_page(0).unwrap().to_display_list(true).unwrap();
-        let tp = list.to_text_page(TextPageFlags::empty()).unwrap();
-        let mut shown = String::new();
-        for block in tp.blocks() {
-            for line in block.lines() {
-                shown.extend(line.chars().filter_map(|c| c.char()));
-            }
-        }
+        let shown = shown_lines(&path).concat();
         assert!(shown.contains(text), "{text:?} not drawn; got {:?}", &shown[shown.len().saturating_sub(80)..]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn notes_fit_wide_letters() {
+        let Some((dir, path)) = scratch("wide") else { return };
+        let mut opened = open(&path).unwrap();
+        save(&path, opened.base_len, &[note("WWW MMM WWW MMM\nsecond line here")], &mut opened.stamp).unwrap();
+        // Neither wrapped nor clipped by the note's box.
+        let shown = shown_lines(&path);
+        for line in ["WWW MMM WWW MMM", "second line here"] {
+            assert!(shown.iter().any(|l| l == line), "{line:?} not drawn; got {:?}", &shown[shown.len() - 3..]);
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
