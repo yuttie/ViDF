@@ -25,18 +25,6 @@ const LINE_HEIGHT: f32 = 1.25;
 pub const NOTE_PADDING: f32 = 2.0;
 pub const NOTE_SIZE: f32 = 9.0;
 
-impl Annot {
-    /// Bounding box in page coordinates.
-    pub fn bbox(&self) -> Rect {
-        match &self.kind {
-            AnnotKind::Highlight { quads } => {
-                quads.iter().map(Quad::bbox).reduce(|a, b| a.union(b)).unwrap_or_default()
-            }
-            AnnotKind::Note { at, text, size } => note_rect(*at, text, *size),
-        }
-    }
-}
-
 pub fn note_rect(at: Vec2, text: &str, size: f32) -> Rect {
     let cols = text.lines().map(|l| l.chars().count()).max().unwrap_or(0).max(1);
     let rows = text.lines().count().max(1) + usize::from(text.ends_with('\n'));
