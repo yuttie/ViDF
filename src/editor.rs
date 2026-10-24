@@ -669,7 +669,7 @@ impl Editor {
 
     fn insert_key(&mut self, k: Key) {
         match k {
-            Key::Esc | Key::Ctrl('c') => self.finish_insert(k == Key::Esc),
+            Key::Esc | Key::Ctrl('c') => self.finish_insert(),
             Key::Enter => self.line.push('\n'),
             Key::Backspace => {
                 self.line.pop();
@@ -685,13 +685,10 @@ impl Editor {
         self.changed();
     }
 
-    fn finish_insert(&mut self, commit: bool) {
+    fn finish_insert(&mut self) {
         self.mode = Mode::Normal;
         let (Some((page, at)), editing) = (self.insert.take(), self.editing.take()) else { return };
         let text = std::mem::take(&mut self.line).trim_end().to_owned();
-        if !commit {
-            return;
-        }
         let color = PALETTE[self.color].ink;
         match editing {
             Some(i) if text.is_empty() => self.delete_annots(vec![i]),
@@ -1101,6 +1098,15 @@ mod tests {
         assert_eq!(e.cursor, Pos { page: 0, idx: 16 });
         keys(&mut e, "gg/gamma\nj");
         assert_eq!(e.cursor, Pos { page: 0, idx: 27 });
+    }
+
+    #[test]
+    fn ctrl_c_keeps_the_note() {
+        let mut e = editor();
+        keys(&mut e, "ihello");
+        e.key(Key::Ctrl('c'));
+        assert_eq!(e.mode, Mode::Normal);
+        assert_eq!(e.annots.len(), 1);
     }
 
     #[test]
