@@ -52,7 +52,10 @@ fn main() -> ExitCode {
         };
     }
     match app::run(path) {
-        bevy::app::AppExit::Success => ExitCode::SUCCESS,
-        bevy::app::AppExit::Error(_) => ExitCode::FAILURE,
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("vidf: {e}");
+            ExitCode::FAILURE
+        }
     }
 }

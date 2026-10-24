@@ -1,199 +1,79 @@
-//! Bevy front end: draws pages and overlays and feeds keys to the editor.
+//! egui front end: draws pages and overlays and feeds keys to the editor.
+//!
+//! egui only repaints on input or when the worker wakes it, so the viewer
+//! sleeps while nothing happens. Everything over the pages is painted
+//! immediately each frame straight from the editor state.
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use bevy::asset::RenderAssetUsages;
-use bevy::input::keyboard::{Key as BevyKey, KeyboardInput};
-use bevy::input::ButtonState;
-use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use bevy::sprite::Anchor;
-use bevy::text::FontSize;
-use bevy::window::PrimaryWindow;
-use bevy::winit::{EventLoopProxyWrapper, WinitSettings, WinitUserEvent};
+use eframe::egui::{
+    self, Align2, Color32, ColorImage, Event, FontId, Key as EguiKey, Pos2, Shape as EShape, Stroke, TextureHandle,
+    TextureOptions,
+};
 
 use crate::editor::{Editor, Effect, Key, Shape};
+use crate::geom::{Rect, Vec2};
 use crate::worker::{self, Request, Response, Waker, Worker};
 
 const STATUS_HEIGHT: f32 = 24.0;
 const STATUS_FONT: f32 = 14.0;
 /// Largest rendered page side in pixels; bounds memory at high zoom.
 const MAX_TEXTURE: f32 = 6144.0;
-const BACKGROUND: Color = Color::srgb(0.18, 0.18, 0.2);
+const BACKGROUND: Color32 = Color32::from_rgb(46, 46, 51);
+const STATUS_BACKGROUND: Color32 = Color32::from_rgb(26, 26, 31);
+const STATUS_TEXT: Color32 = Color32::from_rgb(230, 230, 230);
 
-#[derive(Resource, Deref, DerefMut, Default)]
-struct Ed(Editor);
-
-#[derive(Resource)]
-struct Backend {
-    worker: Worker,
-    waker: Waker,
-    opened: bool,
-}
-
-#[derive(Component)]
-struct PageSprite {
-    page: usize,
-    shown: Option<f32>,
+#[derive(Default)]
+struct PageTexture {
+    shown: Option<(TextureHandle, f32)>,
     requested: Option<f32>,
 }
 
-#[derive(Component)]
-struct Overlay;
-
-#[derive(Component)]
-struct StatusLeft;
-
-#[derive(Component)]
-struct StatusRight;
-
-/// What the overlay was last built for.
-#[derive(Resource, Default)]
-struct Drawn {
-    generation: u64,
-    zoom: f32,
-}
-
-pub fn run(path: PathBuf) -> AppExit {
-    let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
-    let waker = Waker::default();
-    let worker = worker::spawn(path, waker.clone());
-    let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window { title: format!("{name} - ViDF"), ..default() }),
-            ..default()
-        }))
-        .insert_resource(WinitSettings::desktop_app())
-        .insert_resource(ClearColor(BACKGROUND))
-        .insert_resource(Backend { worker, waker, opened: false })
-        .init_resource::<Ed>()
-        .init_resource::<Drawn>()
-        .add_systems(Startup, setup)
-        .add_systems(Update, (poll_worker, keyboard, sync_view, request_renders, draw_overlay, draw_status).chain());
+struct Viewer {
+    ed: Editor,
+    worker: Worker,
+    opened: bool,
+    pages: Vec<PageTexture>,
+    /// Set when the document cannot be opened; reported after the window closes.
+    failure: Arc<Mutex<Option<String>>>,
     #[cfg(feature = "e2e")]
-    e2e::install(&mut app);
-    app.run()
+    script: Option<e2e::Script>,
 }
 
-fn setup(mut commands: Commands, backend: Res<Backend>, proxy: Res<EventLoopProxyWrapper>) {
-    let proxy = Mutex::new((**proxy).clone());
-    let wake = move || {
-        let _ = proxy.lock().unwrap().send_event(WinitUserEvent::WakeUp);
+pub fn run(path: PathBuf) -> Result<(), String> {
+    let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let failure = Arc::new(Mutex::new(None));
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_title(format!("{name} - ViDF")).with_app_id("vidf"),
+        ..Default::default()
     };
-    // Responses sent before the waker was installed still need a frame.
-    wake();
-    let _ = backend.waker.set(Box::new(wake));
-
-    commands.spawn(Camera2d);
-    let font = TextFont::from_font_size(FontSize::Px(STATUS_FONT));
-    let color = TextColor(Color::srgb(0.9, 0.9, 0.9));
-    commands.spawn((
-        Node {
-            position_type: PositionType::Absolute,
-            bottom: Val::Px(0.0),
-            left: Val::Px(0.0),
-            width: Val::Percent(100.0),
-            height: Val::Px(STATUS_HEIGHT),
-            padding: UiRect::horizontal(Val::Px(8.0)),
-            justify_content: JustifyContent::SpaceBetween,
-            align_items: AlignItems::Center,
-            ..default()
-        },
-        BackgroundColor(Color::srgb(0.1, 0.1, 0.12)),
-        children![(Text::new(""), font.clone(), color, StatusLeft), (Text::new(""), font, color, StatusRight)],
-    ));
-}
-
-fn viewport_size(window: &Window) -> Vec2 {
-    Vec2::new(window.width(), (window.height() - STATUS_HEIGHT).max(1.0))
-}
-
-fn poll_worker(
-    mut commands: Commands,
-    mut backend: ResMut<Backend>,
-    mut ed: ResMut<Ed>,
-    mut images: ResMut<Assets<Image>>,
-    mut sprites: Query<(&mut PageSprite, &mut Sprite)>,
-    window: Single<&Window, With<PrimaryWindow>>,
-    mut exit: MessageWriter<AppExit>,
-) {
-    let responses: Vec<Response> = backend.worker.rx.lock().unwrap().try_iter().collect();
-    for resp in responses {
-        match resp {
-            Response::Opened { pages, annots, warning } => {
-                ed.open(pages, annots, viewport_size(&window));
-                for page in 0..ed.view.pages.len() {
-                    commands.spawn((
-                        PageSprite { page, shown: None, requested: None },
-                        Sprite::from_color(Color::WHITE, Vec2::ONE),
-                        Transform::default(),
-                    ));
-                }
-                if let Some(w) = warning {
-                    ed.message = w;
-                }
-                backend.opened = true;
-            }
-            Response::Text { page, text } => ed.set_text(page, text),
-            Response::Rendered { page, scale, width, height, rgba } => {
-                let Some((mut ps, mut sprite)) = sprites.iter_mut().find(|(ps, _)| ps.page == page) else { continue };
-                if ps.requested.is_none() {
-                    // Cancelled while rendering; the page is no longer near the view.
-                    continue;
-                }
-                if ps.requested == Some(scale) {
-                    ps.requested = None;
-                }
-                let size = Extent3d { width, height, depth_or_array_layers: 1 };
-                let image = Image::new(
-                    size,
-                    TextureDimension::D2,
-                    rgba,
-                    TextureFormat::Rgba8UnormSrgb,
-                    RenderAssetUsages::RENDER_WORLD,
-                );
-                sprite.image = images.add(image);
-                ps.shown = Some(scale);
-            }
-            Response::Saved(Ok(n)) => {
-                ed.saved(n);
-                if ed.quit_after_save {
-                    exit.write(AppExit::Success);
-                }
-            }
-            Response::Saved(Err(e)) => {
-                ed.quit_after_save = false;
-                ed.message = format!("write failed: {e}");
-            }
-            Response::Failed(e) if !backend.opened => {
-                eprintln!("vidf: {e}");
-                exit.write(AppExit::error());
-            }
-            Response::Failed(e) => ed.message = e,
-        }
+    let fail = failure.clone();
+    eframe::run_native(
+        "ViDF",
+        options,
+        Box::new(move |cc| {
+            let ctx = cc.egui_ctx.clone();
+            let waker = Waker::default();
+            let _ = waker.set(Box::new(move || ctx.request_repaint()));
+            let worker = worker::spawn(path, waker);
+            Ok(Box::new(Viewer {
+                ed: Editor::default(),
+                worker,
+                opened: false,
+                pages: Vec::new(),
+                failure: fail,
+                #[cfg(feature = "e2e")]
+                script: e2e::Script::from_env(),
+            }))
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+    match failure.lock().unwrap().take() {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
-}
-
-fn convert_key(ev: &KeyboardInput, ctrl: bool) -> Option<Key> {
-    Some(match &ev.logical_key {
-        BevyKey::Character(s) => {
-            let c = s.chars().next()?;
-            if ctrl { Key::Ctrl(c.to_ascii_lowercase()) } else { Key::Char(c) }
-        }
-        BevyKey::Space => Key::Char(' '),
-        BevyKey::Escape => Key::Esc,
-        BevyKey::Enter => Key::Enter,
-        BevyKey::Backspace => Key::Backspace,
-        BevyKey::ArrowUp => Key::Up,
-        BevyKey::ArrowDown => Key::Down,
-        BevyKey::ArrowLeft => Key::Left,
-        BevyKey::ArrowRight => Key::Right,
-        BevyKey::PageUp => Key::PageUp,
-        BevyKey::PageDown => Key::PageDown,
-        _ => return None,
-    })
 }
 
 fn yank(text: String) -> Result<(), String> {
@@ -205,185 +85,231 @@ fn yank(text: String) -> Result<(), String> {
     Ok(())
 }
 
-fn keyboard(
-    mut events: MessageReader<KeyboardInput>,
-    keys: Res<ButtonInput<KeyCode>>,
-    mut ed: ResMut<Ed>,
-    backend: Res<Backend>,
-    mut exit: MessageWriter<AppExit>,
-) {
-    if !backend.opened {
-        events.clear();
-        return;
-    }
-    let ctrl = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
-    for ev in events.read() {
-        if ev.state != ButtonState::Pressed {
-            continue;
+/// Keys that egui reports as key presses; printable characters come as text.
+fn convert_key(key: EguiKey, ctrl: bool) -> Option<Key> {
+    Some(match key {
+        EguiKey::Escape => Key::Esc,
+        EguiKey::Enter => Key::Enter,
+        EguiKey::Backspace => Key::Backspace,
+        EguiKey::ArrowUp => Key::Up,
+        EguiKey::ArrowDown => Key::Down,
+        EguiKey::ArrowLeft => Key::Left,
+        EguiKey::ArrowRight => Key::Right,
+        EguiKey::PageUp => Key::PageUp,
+        EguiKey::PageDown => Key::PageDown,
+        _ if ctrl => {
+            let name = key.name();
+            let mut chars = name.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if c.is_ascii_alphabetic() => Key::Ctrl(c.to_ascii_lowercase()),
+                _ => return None,
+            }
         }
-        let Some(k) = convert_key(ev, ctrl) else { continue };
-        press(k, &mut ed, &backend, &mut exit);
-    }
+        _ => return None,
+    })
 }
 
-fn press(k: Key, ed: &mut Editor, backend: &Backend, exit: &mut MessageWriter<AppExit>) {
-    for fx in ed.key(k) {
-        match fx {
-            Effect::Save => {
-                let annots = ed.annots.clone();
-                let _ = backend.worker.tx.send(Request::Save { annots });
+fn color(c: [f32; 4]) -> Color32 {
+    let [r, g, b, a] = c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+    Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+impl Viewer {
+    fn poll_worker(&mut self, ctx: &egui::Context) {
+        let responses: Vec<Response> = self.worker.rx.lock().unwrap().try_iter().collect();
+        for resp in responses {
+            match resp {
+                Response::Opened { pages, annots, warning } => {
+                    let size = ctx.content_rect().size();
+                    let viewport = Vec2::new(size.x, (size.y - STATUS_HEIGHT).max(1.0));
+                    self.pages = pages.iter().map(|_| PageTexture::default()).collect();
+                    self.ed.open(pages, annots, viewport);
+                    if let Some(w) = warning {
+                        self.ed.message = w;
+                    }
+                    self.opened = true;
+                }
+                Response::Text { page, text } => self.ed.set_text(page, text),
+                Response::Rendered { page, scale, width, height, rgba } => {
+                    let Some(pt) = self.pages.get_mut(page) else { continue };
+                    if pt.requested.is_none() {
+                        // Cancelled while rendering; the page is no longer near the view.
+                        continue;
+                    }
+                    if pt.requested == Some(scale) {
+                        pt.requested = None;
+                    }
+                    let image = ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
+                    let tex = ctx.load_texture(format!("page-{page}"), image, TextureOptions::LINEAR);
+                    pt.shown = Some((tex, scale));
+                }
+                Response::Saved(Ok(n)) => {
+                    self.ed.saved(n);
+                    if self.ed.quit_after_save {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+                Response::Saved(Err(e)) => {
+                    self.ed.quit_after_save = false;
+                    self.ed.message = format!("write failed: {e}");
+                }
+                Response::Failed(e) if !self.opened => {
+                    *self.failure.lock().unwrap() = Some(e);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Response::Failed(e) => self.ed.message = e,
             }
-            Effect::Quit => {
-                exit.write(AppExit::Success);
-            }
-            Effect::Yank(text) => {
-                if let Err(e) = yank(text) {
-                    ed.message = e;
+        }
+    }
+
+    fn press(&mut self, ctx: &egui::Context, k: Key) {
+        for fx in self.ed.key(k) {
+            match fx {
+                Effect::Save => {
+                    let annots = self.ed.annots.clone();
+                    let _ = self.worker.tx.send(Request::Save { annots });
+                }
+                Effect::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Effect::Yank(text) => {
+                    if let Err(e) = yank(text) {
+                        self.ed.message = e;
+                    }
                 }
             }
         }
     }
-}
 
-fn sync_view(
-    mut ed: ResMut<Ed>,
-    window: Single<&Window, With<PrimaryWindow>>,
-    mut camera: Single<&mut Transform, With<Camera2d>>,
-    mut pages: Query<(&PageSprite, &mut Sprite, &mut Transform), Without<Camera2d>>,
-) {
-    if ed.view.is_empty() {
-        return;
-    }
-    let size = viewport_size(&window);
-    if ed.view.size != size {
-        ed.view.size = size;
-        ed.view.scroll(Vec2::ZERO);
-    }
-    // The viewport sits above the status bar.
-    let c = ed.view.center - Vec2::new(0.0, STATUS_HEIGHT / 2.0);
-    if camera.translation.truncate() != c {
-        camera.translation = c.extend(camera.translation.z);
-    }
-    for (ps, mut sprite, mut tf) in &mut pages {
-        let r = ed.view.page_rect(ps.page);
-        if sprite.custom_size != Some(r.size()) {
-            sprite.custom_size = Some(r.size());
+    fn keyboard(&mut self, ctx: &egui::Context) {
+        if !self.opened {
+            return;
         }
-        let t = r.center().extend(0.0);
-        if tf.translation != t {
-            tf.translation = t;
-        }
-    }
-}
-
-fn request_renders(
-    ed: Res<Ed>,
-    backend: Res<Backend>,
-    window: Single<&Window, With<PrimaryWindow>>,
-    mut pages: Query<(&mut PageSprite, &mut Sprite)>,
-) {
-    let view = &ed.view;
-    if view.is_empty() {
-        return;
-    }
-    let vp = view.viewport();
-    // Render one screen ahead, and free textures more than two screens away.
-    let near = Rect::from_center_size(vp.center(), vp.size() * Vec2::new(1.0, 3.0));
-    let far = Rect::from_center_size(vp.center(), vp.size() * Vec2::new(1.0, 5.0));
-    let dpr = window.scale_factor();
-    for (mut ps, mut sprite) in &mut pages {
-        let r = view.page_rect(ps.page);
-        let rect_y = |a: Rect| r.max.y >= a.min.y && r.min.y <= a.max.y;
-        if rect_y(near) {
-            let info = &view.pages[ps.page];
-            let scale = (view.zoom * dpr).min(MAX_TEXTURE / info.size.max_element());
-            let close = |s: Option<f32>| s.is_some_and(|s| (s / scale - 1.0).abs() < 0.01);
-            if !close(ps.shown) && !close(ps.requested) {
-                let _ = backend.worker.tx.send(Request::Render { page: ps.page, scale });
-                ps.requested = Some(scale);
-            }
-        } else if !rect_y(far) {
-            if ps.shown.take().is_some() {
-                sprite.image = Handle::default();
-            }
-            if ps.requested.take().is_some() {
-                let _ = backend.worker.tx.send(Request::Cancel { page: ps.page });
+        let events = ctx.input(|i| i.events.clone());
+        for ev in events {
+            let keys: Vec<Key> = match ev {
+                Event::Text(s) => s.chars().map(Key::Char).collect(),
+                Event::Key { key, pressed: true, modifiers, .. } => convert_key(key, modifiers.ctrl).into_iter().collect(),
+                // egui turns these shortcuts into clipboard events.
+                Event::Copy => vec![Key::Ctrl('c')],
+                Event::Cut => vec![Key::Ctrl('x')],
+                _ => continue,
+            };
+            for k in keys {
+                self.press(ctx, k);
             }
         }
     }
-}
 
-fn srgba(c: [f32; 4]) -> Color {
-    Color::srgba(c[0], c[1], c[2], c[3])
-}
-
-fn draw_overlay(
-    mut commands: Commands,
-    ed: Res<Ed>,
-    mut drawn: ResMut<Drawn>,
-    old: Query<Entity, With<Overlay>>,
-) {
-    if drawn.generation == ed.generation && drawn.zoom == ed.view.zoom {
-        return;
-    }
-    drawn.generation = ed.generation;
-    drawn.zoom = ed.view.zoom;
-    for e in &old {
-        commands.entity(e).despawn();
-    }
-    let view = &ed.view;
-    if view.is_empty() {
-        return;
-    }
-    for shape in ed.shapes() {
-        match shape {
-            Shape::Quad { page, quad, color, z } => {
-                let [ul, ur, ll, lr] = [quad.ul, quad.ur, quad.ll, quad.lr].map(|p| view.to_world(page, p));
-                let center = (ul + ur + ll + lr) / 4.0;
-                let along = ur - ul;
-                let size = Vec2::new(along.length(), (ll - ul).length());
-                commands.spawn((
-                    Overlay,
-                    Sprite::from_color(srgba(color), size),
-                    Transform::from_translation(center.extend(z)).with_rotation(Quat::from_rotation_z(along.to_angle())),
-                ));
-            }
-            Shape::Rect { page, rect, color, z } => {
-                let r = view.rect_to_world(page, rect);
-                commands.spawn((
-                    Overlay,
-                    Sprite::from_color(srgba(color), r.size()),
-                    Transform::from_translation(r.center().extend(z)),
-                ));
-            }
-            Shape::Text { page, at, text, size, color, z } => {
-                commands.spawn((
-                    Overlay,
-                    Text2d::new(text),
-                    TextFont::from_font_size(FontSize::Px(size * view.zoom)),
-                    TextColor(Color::srgb(color[0], color[1], color[2])),
-                    Anchor::TOP_LEFT,
-                    Transform::from_translation(view.to_world(page, at).extend(z)),
-                ));
+    fn request_renders(&mut self, dpr: f32) {
+        let view = &self.ed.view;
+        if view.is_empty() {
+            return;
+        }
+        let vp = view.viewport();
+        // Render one screen ahead, and free textures more than two screens away.
+        let near = Rect::from_center_size(vp.center(), vp.size() * Vec2::new(1.0, 3.0));
+        let far = Rect::from_center_size(vp.center(), vp.size() * Vec2::new(1.0, 5.0));
+        for (page, pt) in self.pages.iter_mut().enumerate() {
+            let r = view.page_rect(page);
+            let overlaps = |a: Rect| r.max.y >= a.min.y && r.min.y <= a.max.y;
+            if overlaps(near) {
+                let info = &view.pages[page];
+                let scale = (view.zoom * dpr).min(MAX_TEXTURE / info.size.max_element());
+                let close = |s: Option<f32>| s.is_some_and(|s| (s / scale - 1.0).abs() < 0.01);
+                if !close(pt.shown.as_ref().map(|s| s.1)) && !close(pt.requested) {
+                    let _ = self.worker.tx.send(Request::Render { page, scale });
+                    pt.requested = Some(scale);
+                }
+            } else if !overlaps(far) {
+                pt.shown = None;
+                if pt.requested.take().is_some() {
+                    let _ = self.worker.tx.send(Request::Cancel { page });
+                }
             }
         }
     }
+
+    fn draw_pages(&self, painter: &egui::Painter, area: egui::Rect) {
+        let view = &self.ed.view;
+        let center = view.center;
+        let to_screen = |w: Vec2| area.center() + egui::vec2(w.x - center.x, center.y - w.y);
+        let screen_rect = |r: Rect| egui::Rect::from_two_pos(to_screen(r.min), to_screen(r.max));
+        for (page, pt) in self.pages.iter().enumerate() {
+            let rect = screen_rect(view.page_rect(page));
+            if !rect.intersects(area) {
+                continue;
+            }
+            match &pt.shown {
+                Some((tex, _)) => {
+                    let uv = egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                    painter.image(tex.id(), rect, uv, Color32::WHITE);
+                }
+                None => {
+                    painter.rect_filled(rect, 0.0, Color32::WHITE);
+                }
+            }
+        }
+        let to_page = |page: usize, p: Vec2| to_screen(view.to_world(page, p));
+        let mut shapes = self.ed.shapes();
+        let z = |s: &Shape| match s {
+            Shape::Quad { z, .. } | Shape::Rect { z, .. } | Shape::Text { z, .. } => *z,
+        };
+        shapes.sort_by(|a, b| z(a).total_cmp(&z(b)));
+        for shape in shapes {
+            match shape {
+                Shape::Quad { page, quad, color: c, .. } => {
+                    let points = [quad.ul, quad.ur, quad.lr, quad.ll].map(|p| to_page(page, p)).to_vec();
+                    painter.add(EShape::convex_polygon(points, color(c), Stroke::NONE));
+                }
+                Shape::Rect { page, rect, color: c, .. } => {
+                    let r = egui::Rect::from_two_pos(to_page(page, rect.min), to_page(page, rect.max));
+                    painter.rect_filled(r, 0.0, color(c));
+                }
+                Shape::Text { page, at, text, size, color: [r, g, b], .. } => {
+                    let font = FontId::monospace(size * view.zoom);
+                    painter.text(to_page(page, at), Align2::LEFT_TOP, text, font, color([r, g, b, 1.0]));
+                }
+            }
+        }
+    }
+
+    fn status_bar(&self, ui: &mut egui::Ui) {
+        let (left, right) = self.ed.status();
+        let font = FontId::monospace(STATUS_FONT);
+        let rect = ui.max_rect();
+        let painter = ui.painter();
+        painter.rect_filled(rect, 0.0, STATUS_BACKGROUND);
+        let mid = rect.left_center() + egui::vec2(8.0, 0.0);
+        painter.text(mid, Align2::LEFT_CENTER, left, font.clone(), STATUS_TEXT);
+        let end = rect.right_center() - egui::vec2(8.0, 0.0);
+        painter.text(end, Align2::RIGHT_CENTER, right, font, STATUS_TEXT);
+    }
 }
 
-fn draw_status(
-    ed: Res<Ed>,
-    mut left: Single<&mut Text, (With<StatusLeft>, Without<StatusRight>)>,
-    mut right: Single<&mut Text, (With<StatusRight>, Without<StatusLeft>)>,
-) {
-    if !ed.is_changed() {
-        return;
-    }
-    let (l, r) = ed.status();
-    if left.0 != l {
-        left.0 = l;
-    }
-    if right.0 != r {
-        right.0 = r;
+impl eframe::App for Viewer {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.poll_worker(&ctx);
+        self.keyboard(&ctx);
+        #[cfg(feature = "e2e")]
+        e2e::step(self, &ctx);
+
+        egui::Panel::bottom("status").exact_size(STATUS_HEIGHT).frame(egui::Frame::NONE).show(ui, |ui| {
+            self.status_bar(ui);
+        });
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            let area = ui.max_rect();
+            ui.painter().rect_filled(area, 0.0, BACKGROUND);
+            if self.ed.view.is_empty() {
+                return;
+            }
+            let size = Vec2::new(area.width(), area.height());
+            if self.ed.view.size != size {
+                self.ed.view.size = size;
+                self.ed.view.scroll(Vec2::ZERO);
+            }
+            self.draw_pages(&ui.painter_at(area), area);
+        });
+        self.request_renders(ctx.pixels_per_point());
     }
 }
 
@@ -392,16 +318,16 @@ fn draw_status(
 /// `<C-d>`), then the window is captured to `VIDF_SHOT` and the app exits.
 #[cfg(feature = "e2e")]
 mod e2e {
-    use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
 
-    #[derive(Resource)]
-    struct Script {
+    pub struct Script {
         keys: Vec<Key>,
         shot: PathBuf,
         frames: u32,
         stage: u8,
+        done: Arc<AtomicBool>,
     }
 
     fn parse(s: &str) -> Vec<Key> {
@@ -431,41 +357,56 @@ mod e2e {
         out
     }
 
-    pub fn install(app: &mut App) {
-        let (Ok(keys), Ok(shot)) = (std::env::var("VIDF_KEYS"), std::env::var("VIDF_SHOT")) else { return };
-        app.insert_resource(WinitSettings::game())
-            .insert_resource(Script { keys: parse(&keys), shot: shot.into(), frames: 0, stage: 0 })
-            .add_systems(Update, step.after(draw_status));
+    impl Script {
+        pub fn from_env() -> Option<Script> {
+            let (Ok(keys), Ok(shot)) = (std::env::var("VIDF_KEYS"), std::env::var("VIDF_SHOT")) else { return None };
+            Some(Script { keys: parse(&keys), shot: shot.into(), frames: 0, stage: 0, done: Arc::default() })
+        }
     }
 
-    fn step(
-        mut commands: Commands,
-        mut script: ResMut<Script>,
-        mut ed: ResMut<Ed>,
-        backend: Res<Backend>,
-        pages: Query<&PageSprite>,
-        mut exit: MessageWriter<AppExit>,
-    ) {
-        let settled = backend.opened
-            && ed.text.pages.iter().all(Option::is_some)
-            && pages.iter().all(|p| p.requested.is_none());
+    /// Writes an RGBA screenshot as PNG, using MuPDF's encoder.
+    fn save_png(image: &ColorImage, path: &std::path::Path) -> Result<(), String> {
+        let [w, h] = image.size;
+        let mut pix = mupdf::Pixmap::new_with_w_h(&mupdf::Colorspace::device_rgb(), w as i32, h as i32, false)
+            .map_err(|e| e.to_string())?;
+        let stride = pix.stride() as usize;
+        let samples = pix.samples_mut();
+        for (y, row) in image.pixels.chunks(w).enumerate() {
+            for (x, p) in row.iter().enumerate() {
+                samples[y * stride + x * 3..][..3].copy_from_slice(&[p.r(), p.g(), p.b()]);
+            }
+        }
+        pix.save_as(path.to_str().ok_or("non UTF-8 path")?, mupdf::pixmap::ImageFormat::PNG).map_err(|e| e.to_string())
+    }
+
+    pub fn step(v: &mut Viewer, ctx: &egui::Context) {
+        let Some(script) = &mut v.script else { return };
+        ctx.request_repaint();
+        let settled = v.opened
+            && v.ed.text.pages.iter().all(Option::is_some)
+            && v.pages.iter().all(|p| p.requested.is_none());
         script.frames += 1;
         match script.stage {
             0 if settled => {
-                for k in std::mem::take(&mut script.keys) {
-                    press(k, &mut ed, &backend, &mut exit);
-                }
+                let keys = std::mem::take(&mut script.keys);
                 script.stage = 1;
                 script.frames = 0;
+                for k in keys {
+                    v.press(ctx, k);
+                }
             }
             1 if settled && script.frames > 5 => {
-                commands.spawn(Screenshot::primary_window()).observe(save_to_disk(script.shot.clone()));
+                let (shot, done) = (script.shot.clone(), script.done.clone());
+                let callback = egui::ScreenshotCallback::new(move |image| {
+                    if let Err(e) = save_png(&image, &shot) {
+                        eprintln!("screenshot: {e}");
+                    }
+                    done.store(true, Ordering::SeqCst);
+                });
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(callback));
                 script.stage = 2;
-                script.frames = 0;
             }
-            2 if script.frames > 10 => {
-                exit.write(AppExit::Success);
-            }
+            2 if script.done.load(Ordering::SeqCst) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             _ => {}
         }
     }

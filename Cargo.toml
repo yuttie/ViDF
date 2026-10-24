@@ -4,34 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = { version = "0.20", default-features = false, features = [
-    "std",
-    "multi_threaded",
-    "async_executor",
-    "bevy_asset",
-    "bevy_log",
-    "bevy_winit",
-    "bevy_window",
-    "wayland",
-    "keyboard",
-    "bevy_render",
-    "bevy_core_pipeline",
-    "bevy_camera",
-    "bevy_color",
-    "bevy_image",
-    "bevy_sprite",
-    "bevy_sprite_render",
-    "bevy_text",
-    "default_font",
-    "bevy_ui",
-    "bevy_ui_render",
-] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "default_fonts"] }
 glam = "0.33"
 mupdf = { version = "0.8", default-features = false, features = ["base14-fonts"] }
 
 [features]
 # Scripted key input and screenshots for end-to-end checks.
-e2e = ["bevy/png"]
+e2e = []
 
 [profile.dev]
 opt-level = 1
