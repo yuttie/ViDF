@@ -369,6 +369,17 @@ pub fn save(path: &Path, base_len: usize, annots: &[Annot], stamp: &mut Stamp) -
     Ok(())
 }
 
+/// Removes the ViDF update of the file at `path`. Returns how many
+/// annotations were removed, and a warning if older ViDF annotations keep
+/// the file from being the original.
+pub fn clear(path: &Path) -> Result<(usize, Option<String>), String> {
+    let mut o = open(path)?;
+    if !o.annots.is_empty() {
+        save(path, o.base_len, &[], &mut o.stamp)?;
+    }
+    Ok((o.annots.len(), o.warning))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,9 +455,12 @@ mod tests {
         assert!(resaved.len() < annotated.len());
         assert_eq!(open(&path).unwrap().annots.len(), 1);
 
-        // Clearing restores the original bytes.
-        save(&path, original.len(), &[], &mut reopened.stamp).unwrap();
+        // Clearing restores the original bytes, and then has nothing to do.
+        assert_eq!(clear(&path).unwrap(), (1, None));
         assert_eq!(fs::read(&path).unwrap(), original);
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(clear(&path).unwrap(), (0, None));
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -523,10 +537,13 @@ mod tests {
         save(&path, opened.base_len, &[note("second")], &mut opened.stamp).unwrap();
         drop(opened);
         assert_eq!(&fs::read(&path).unwrap()[..theirs.len()], &theirs[..]);
-        let mut opened = open(&path).unwrap();
+        let opened = open(&path).unwrap();
         assert_eq!(opened.annots, [note("second")]);
-        assert!(opened.warning.is_some());
-        save(&path, opened.base_len, &[], &mut opened.stamp).unwrap();
+        drop(opened);
+        // Clearing removes the new annotation but warns about the old one.
+        let (removed, warning) = clear(&path).unwrap();
+        assert_eq!(removed, 1);
+        assert!(warning.is_some());
         assert_eq!(fs::read(&path).unwrap(), theirs);
         fs::remove_dir_all(&dir).unwrap();
     }

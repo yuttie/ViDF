@@ -36,17 +36,28 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
     if clear {
-        let result = pdf::open(&path).and_then(|mut o| {
-            let n = o.annots.len();
-            pdf::save(&path, o.base_len, &[], &mut o.stamp).map(|()| n)
-        });
-        return match result {
-            Ok(n) => {
-                println!("removed {n} annotation(s); {} is the original file again", path.display());
-                ExitCode::SUCCESS
-            }
+        let (n, warning) = match pdf::clear(&path) {
+            Ok(r) => r,
             Err(e) => {
                 eprintln!("vidf: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let removed = format!("removed {n} annotation{}", if n == 1 { "" } else { "s" });
+        return match warning {
+            None if n == 0 => {
+                println!("{}: no ViDF annotations", path.display());
+                ExitCode::SUCCESS
+            }
+            None => {
+                println!("{removed}; {} is the original file again", path.display());
+                ExitCode::SUCCESS
+            }
+            Some(w) => {
+                if n > 0 {
+                    println!("{removed}");
+                }
+                eprintln!("vidf: {w}; {} is not the original file", path.display());
                 ExitCode::FAILURE
             }
         };
