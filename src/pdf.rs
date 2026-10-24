@@ -3,12 +3,16 @@
 //!
 //! Annotations are never merged into the original bytes. They are appended
 //! as one incremental update, and each of them records the length of the
-//! file before that update (`/ViDFBase`). Writing again first cuts the file back to that
-//! length, so the file is always "original bytes + at most one ViDF update",
+//! file before that update (`/ViDFBase`). Writing again replaces everything
+//! after that length in place, so the file is always "original bytes + at
+//! most one ViDF update",
 //! and clearing all annotations restores the original byte for byte.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::geom::Vec2;
 use mupdf::color::AnnotationColor;
@@ -209,17 +213,38 @@ fn fill_note_background(annot: &PdfObject) -> Result<(), String> {
     ap.write_stream_buffer(&Buffer::from_bytes(&content).map_err(err)?).map_err(err)
 }
 
-fn tmp_path(path: &Path) -> PathBuf {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    path.with_file_name(format!(".{name}.vidf-tmp"))
+/// A private file for MuPDF to write to, removed when dropped.
+struct TempFile(PathBuf);
+
+impl TempFile {
+    fn new() -> Result<TempFile, String> {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir();
+        loop {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("vidf-{}-{n}.pdf", std::process::id()));
+            match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
+                Ok(_) => return Ok(TempFile(path)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 1000 => continue,
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            }
+        }
+    }
 }
 
-fn append_annots(tmp: &Path, base_len: usize, annots: &[Annot]) -> Result<(), String> {
-    let tmp = tmp.to_str().ok_or("non UTF-8 path")?;
-    let doc = PdfDocument::open(tmp).map_err(err)?;
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// `base` followed by an incremental update holding `annots`.
+fn with_annots(base: &[u8], annots: &[Annot]) -> Result<Vec<u8>, String> {
+    let doc = PdfDocument::from_bytes(base).map_err(err)?;
     if !doc.can_be_saved_incrementally() {
         return Err("this PDF is damaged and cannot be annotated without rewriting it".into());
     }
+    let base_len = base.len();
     let base = PdfObject::new_int(i32::try_from(base_len).map_err(err)?).map_err(err)?;
     let mut pages = std::collections::HashMap::new();
     for (i, a) in annots.iter().enumerate() {
@@ -258,30 +283,44 @@ fn append_annots(tmp: &Path, base_len: usize, annots: &[Annot]) -> Result<(), St
         }
     }
     drop(pages);
+    let tmp = TempFile::new()?;
     let mut opts = PdfWriteOptions::default();
     opts.set_incremental(true);
-    doc.save_with_options(tmp, opts).map_err(err)
+    doc.save_with_options(tmp.0.to_str().ok_or("non UTF-8 temporary directory")?, opts).map_err(err)?;
+    fs::read(&tmp.0).map_err(err)
+}
+
+/// Replaces everything in `file` after `at` by `tail`. The bytes before
+/// `at` are never written, so links, ownership and permissions stay as
+/// they are. If writing fails, the file is cut back to `at`.
+fn replace_tail(file: &mut File, at: usize, tail: &[u8]) -> Result<(), String> {
+    let at = at as u64;
+    let mut write = || {
+        file.seek(SeekFrom::Start(at))?;
+        file.write_all(tail)?;
+        file.set_len(at + tail.len() as u64)?;
+        file.sync_data()
+    };
+    write().map_err(|e| match file.set_len(at) {
+        Ok(()) => format!("{e}; the file is the original again, without annotations"),
+        Err(_) => e.to_string(),
+    })
 }
 
 /// Replaces the ViDF update of the file at `path` with one holding `annots`.
 /// With no annotations, the original file is restored exactly.
 pub fn save(path: &Path, base_len: usize, annots: &[Annot]) -> Result<(), String> {
-    let bytes = fs::read(path).map_err(err)?;
+    let mut file = OpenOptions::new().read(true).write(true).open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(err)?;
     if bytes.len() < base_len || !ends_with_eof(&bytes[..base_len]) {
         return Err("the file changed on disk since it was opened".into());
     }
-    let tmp = tmp_path(path);
-    let result = fs::write(&tmp, &bytes[..base_len]).map_err(err).and_then(|()| {
-        drop(bytes);
-        if annots.is_empty() { Ok(()) } else { append_annots(&tmp, base_len, annots) }
-    });
-    match result.and_then(|()| fs::rename(&tmp, path).map_err(err)) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
-        }
+    let tail = if annots.is_empty() { Vec::new() } else { with_annots(&bytes[..base_len], annots)?.split_off(base_len) };
+    if tail != bytes[base_len..] {
+        replace_tail(&mut file, base_len, &tail)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -378,6 +417,28 @@ mod tests {
             }
         }
         assert!(shown.contains(text), "{text:?} not drawn; got {:?}", &shown[shown.len().saturating_sub(80)..]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_keeps_links_and_permissions() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let Some((dir, path)) = scratch("links") else { return };
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let (link, hard) = (dir.join("link.pdf"), dir.join("hard.pdf"));
+        symlink(&path, &link).unwrap();
+        fs::hard_link(&path, &hard).unwrap();
+        let opened = open(&link).unwrap();
+        save(&link, opened.base_len, &[note("x")]).unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(meta.nlink(), 2);
+        assert_eq!(open(&hard).unwrap().annots.len(), 1);
+        // A read-only file is left alone.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(save(&path, opened.base_len, &[]).is_err());
+        assert_eq!(open(&path).unwrap().annots.len(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 
