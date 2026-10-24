@@ -60,7 +60,9 @@ pub struct Editor {
     undo: Vec<Vec<Annot>>,
     redo: Vec<Vec<Annot>>,
     pub cursor: Pos,
-    sticky_x: Option<f32>,
+    /// Column kept by `j` and `k`, valid while the cursor stays where they
+    /// left it.
+    sticky_x: Option<(Pos, f32)>,
     anchor: Pos,
     pub mode: Mode,
     pending: String,
@@ -218,19 +220,21 @@ impl Editor {
         let n = self.count.unwrap_or(1);
         let repeat = |p: Pos, f: &dyn Fn(Pos) -> Pos| (0..n).fold(p, |p, _| f(p));
         let c = self.cursor;
-        let mut keep_x = false;
         let new = match k {
             Key::Char('h') | Key::Left | Key::Backspace => repeat(c, &|p| t.char_back(p)),
             Key::Char('l') | Key::Right | Key::Char(' ') => repeat(c, &|p| t.char_fwd(p)),
             Key::Char('j') | Key::Down | Key::Char('k') | Key::Up => {
-                let x = self.sticky_x.unwrap_or_else(|| self.cursor_x());
-                keep_x = true;
-                self.sticky_x = Some(x);
-                if matches!(k, Key::Char('j') | Key::Down) {
+                let x = match self.sticky_x {
+                    Some((p, x)) if p == c => x,
+                    _ => self.cursor_x(),
+                };
+                let new = if matches!(k, Key::Char('j') | Key::Down) {
                     repeat(c, &|p| t.line_down(p, x))
                 } else {
                     repeat(c, &|p| t.line_up(p, x))
-                }
+                };
+                self.sticky_x = Some((new, x));
+                new
             }
             Key::Char('w') => repeat(c, &|p| t.word_fwd(p)),
             Key::Char('b') => repeat(c, &|p| t.word_back(p)),
@@ -281,9 +285,6 @@ impl Editor {
             }
             _ => return false,
         };
-        if !keep_x {
-            self.sticky_x = None;
-        }
         self.count = None;
         self.cursor = new;
         self.follow_cursor();
@@ -973,6 +974,15 @@ mod tests {
         keys(&mut e, "vea");
         assert!(!e.may_close());
         assert!(e.status().0.starts_with("unsaved annotations"));
+    }
+
+    #[test]
+    fn jumps_forget_the_column() {
+        let mut e = editor();
+        keys(&mut e, "$jkggj");
+        assert_eq!(e.cursor, Pos { page: 0, idx: 16 });
+        keys(&mut e, "gg/gamma\nj");
+        assert_eq!(e.cursor, Pos { page: 0, idx: 27 });
     }
 
     #[test]
