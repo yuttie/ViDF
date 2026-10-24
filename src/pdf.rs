@@ -9,6 +9,7 @@
 //! and clearing all annotations restores the original byte for byte.
 
 use std::fs::{self, File, OpenOptions};
+use std::hash::{DefaultHasher, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -43,6 +44,23 @@ pub struct Opened {
     pub pages: Vec<PageInfo>,
     pub annots: Vec<Annot>,
     pub warning: Option<String>,
+    pub stamp: Stamp,
+}
+
+/// What the file held when ViDF last read or wrote it, so that changes
+/// made by other programs are never written over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    len: usize,
+    hash: u64,
+}
+
+impl Stamp {
+    fn of(bytes: &[u8]) -> Stamp {
+        let mut h = DefaultHasher::new();
+        h.write(bytes);
+        Stamp { len: bytes.len(), hash: h.finish() }
+    }
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -83,13 +101,12 @@ fn ends_with_eof(bytes: &[u8]) -> bool {
     bytes[..end].ends_with(b"%%EOF")
 }
 
-/// Checks the `/ViDFBase` recorded in our annotations: the length of the
-/// file before the ViDF update.
-fn check_base_len(len: i32, bytes: &[u8]) -> Result<usize, String> {
-    match usize::try_from(len) {
-        Ok(len) if len > 0 && len < bytes.len() && ends_with_eof(&bytes[..len]) => Ok(len),
-        _ => Err(format!("ignoring invalid /{BASE_KEY} {len}; the file was modified by another tool")),
-    }
+/// Whether the latest revision of `doc` directly follows its first `len`
+/// bytes, so that no other program appended an update after it.
+fn is_last_update(doc: &PdfDocument, len: usize) -> bool {
+    let prev = doc.trailer().ok().and_then(|t| t.get_dict("Prev").ok().flatten());
+    let prev = prev.and_then(|p| usize::try_from(p.as_int().ok()?).ok());
+    prev.is_some_and(|p| p < len)
 }
 
 fn is_ours(annot: &mupdf::pdf::PdfAnnotation) -> bool {
@@ -97,25 +114,22 @@ fn is_ours(annot: &mupdf::pdf::PdfAnnotation) -> bool {
     name.is_some_and(|n| n.starts_with(NAME_PREFIX))
 }
 
-/// ViDF annotations and the `/ViDFBase` they record, if any.
-fn load_annots(doc: &PdfDocument) -> Result<(Vec<Annot>, Option<i32>), String> {
+/// ViDF annotations, each with the `/ViDFBase` it records.
+fn load_annots(doc: &PdfDocument) -> Result<Vec<(Option<i32>, Annot)>, String> {
     let mut out = Vec::new();
-    let mut base = None;
     for page in 0..doc.page_count().map_err(err)? {
         let p = doc.load_pdf_page(page).map_err(err)?;
         for a in p.annotations() {
             if !is_ours(&a) {
                 continue;
             }
-            if let Some(v) = a.object().get_dict(BASE_KEY).map_err(err)? {
-                base = Some(v.as_int().map_err(err)?);
-            }
+            let base = a.object().get_dict(BASE_KEY).map_err(err)?.map(|v| v.as_int()).transpose().map_err(err)?;
             let page = page as usize;
             match a.r#type().map_err(err)? {
                 PdfAnnotationType::Highlight => {
                     let quads = a.quad_points().map_err(err)?.into_iter().map(from_mupdf_quad).collect();
                     let color = from_annot_color(a.color().map_err(err)?);
-                    out.push(Annot { page, color, kind: AnnotKind::Highlight { quads } });
+                    out.push((base, Annot { page, color, kind: AnnotKind::Highlight { quads } }));
                 }
                 PdfAnnotationType::FreeText => {
                     let r = a.rect().map_err(err)?;
@@ -124,13 +138,28 @@ fn load_annots(doc: &PdfDocument) -> Result<(Vec<Annot>, Option<i32>), String> {
                     let size = da.as_ref().map_or(crate::annot::NOTE_SIZE, |d| d.size);
                     let color = from_annot_color(da.and_then(|d| d.color));
                     let at = Vec2::new(r.x0, r.y0);
-                    out.push(Annot { page, color, kind: AnnotKind::Note { at, text, size } });
+                    out.push((base, Annot { page, color, kind: AnnotKind::Note { at, text, size } }));
                 }
                 _ => {}
             }
         }
     }
-    Ok((out, base))
+    Ok(out)
+}
+
+/// Finds the ViDF update of the file `bytes`: the length of the file
+/// before it, and the annotations in it. ViDF annotations elsewhere are
+/// stale and only counted: another program changed the file after they
+/// were written, so they are part of the original now.
+fn own_update(full: &PdfDocument, bytes: &[u8]) -> Result<(usize, Vec<Annot>, usize), String> {
+    let found = load_annots(full)?;
+    let latest = found.iter().filter_map(|f| f.0).max();
+    let base_len = match latest.map(usize::try_from) {
+        Some(Ok(len)) if len > 0 && len < bytes.len() && ends_with_eof(&bytes[..len]) && is_last_update(full, len) => len,
+        _ => return Ok((bytes.len(), Vec::new(), found.len())),
+    };
+    let (own, stale): (Vec<_>, Vec<_>) = found.into_iter().partition(|f| f.0 == latest);
+    Ok((base_len, own.into_iter().map(|f| f.1).collect(), stale.len()))
 }
 
 pub fn open(path: &Path) -> Result<Opened, String> {
@@ -139,25 +168,23 @@ pub fn open(path: &Path) -> Result<Opened, String> {
     if full.needs_password().map_err(err)? {
         return Err("encrypted PDFs are not supported".into());
     }
-    let (annots, base) = load_annots(&full)?;
-    let (base_len, warning) = match base.map(|len| check_base_len(len, &bytes)) {
-        Some(Ok(len)) => (Some(len), None),
-        Some(Err(w)) => (None, Some(w)),
-        None => (None, None),
-    };
-    let (doc, base_len, annots) = match base_len {
-        Some(len) => {
-            drop(full);
-            (PdfDocument::from_bytes(&bytes[..len]).map_err(err)?, len, annots)
-        }
-        None => (full, bytes.len(), Vec::new()),
+    let (base_len, annots, stale) = own_update(&full, &bytes)?;
+    let warning = (stale > 0).then(|| {
+        let s = if stale == 1 { "" } else { "s" };
+        format!("{stale} older ViDF annotation{s} can no longer be changed: another program modified the file")
+    });
+    let doc = if base_len == bytes.len() {
+        full
+    } else {
+        drop(full);
+        PdfDocument::from_bytes(&bytes[..base_len]).map_err(err)?
     };
     let mut pages = Vec::new();
     for i in 0..doc.page_count().map_err(err)? {
         let b = doc.load_page(i).map_err(err)?.bounds().map_err(err)?;
         pages.push(PageInfo { size: Vec2::new(b.x1 - b.x0, b.y1 - b.y0), origin: Vec2::new(b.x0, b.y0) });
     }
-    Ok(Opened { doc, base_len, pages, annots, warning })
+    Ok(Opened { doc, base_len, pages, annots, warning, stamp: Stamp::of(&bytes) })
 }
 
 /// Renders `page` at `scale` pixels per point into tightly packed RGBA.
@@ -292,33 +319,41 @@ fn with_annots(base: &[u8], annots: &[Annot]) -> Result<Vec<u8>, String> {
 
 /// Replaces everything in `file` after `at` by `tail`. The bytes before
 /// `at` are never written, so links, ownership and permissions stay as
-/// they are. If writing fails, the file is cut back to `at`.
-fn replace_tail(file: &mut File, at: usize, tail: &[u8]) -> Result<(), String> {
+/// they are.
+fn write_tail(file: &mut File, at: usize, tail: &[u8]) -> io::Result<()> {
     let at = at as u64;
-    let mut write = || {
-        file.seek(SeekFrom::Start(at))?;
-        file.write_all(tail)?;
-        file.set_len(at + tail.len() as u64)?;
-        file.sync_data()
-    };
-    write().map_err(|e| match file.set_len(at) {
-        Ok(()) => format!("{e}; the file is the original again, without annotations"),
-        Err(_) => e.to_string(),
-    })
+    file.seek(SeekFrom::Start(at))?;
+    file.write_all(tail)?;
+    file.set_len(at + tail.len() as u64)?;
+    file.sync_data()
 }
 
 /// Replaces the ViDF update of the file at `path` with one holding `annots`.
-/// With no annotations, the original file is restored exactly.
-pub fn save(path: &Path, base_len: usize, annots: &[Annot]) -> Result<(), String> {
+/// With no annotations, the original file is restored exactly. Nothing is
+/// written if the file no longer matches `stamp`, which is then updated to
+/// what was written.
+pub fn save(path: &Path, base_len: usize, annots: &[Annot], stamp: &mut Stamp) -> Result<(), String> {
     let mut file = OpenOptions::new().read(true).write(true).open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(err)?;
-    if bytes.len() < base_len || !ends_with_eof(&bytes[..base_len]) {
-        return Err("the file changed on disk since it was opened".into());
+    if Stamp::of(&bytes) != *stamp || bytes.len() < base_len {
+        return Err("another program changed the file since ViDF read it; reopen it to annotate".into());
     }
     let tail = if annots.is_empty() { Vec::new() } else { with_annots(&bytes[..base_len], annots)?.split_off(base_len) };
     if tail != bytes[base_len..] {
-        replace_tail(&mut file, base_len, &tail)?;
+        if let Err(e) = write_tail(&mut file, base_len, &tail) {
+            // Rather than leave half an update, go back to the original.
+            return Err(match file.set_len(base_len as u64) {
+                Ok(()) => {
+                    *stamp = Stamp::of(&bytes[..base_len]);
+                    format!("{e}; the file is the original again, without annotations")
+                }
+                Err(_) => e.to_string(),
+            });
+        }
+        bytes.truncate(base_len);
+        bytes.extend_from_slice(&tail);
+        *stamp = Stamp::of(&bytes);
     }
     Ok(())
 }
@@ -362,7 +397,7 @@ mod tests {
         let Some((dir, path)) = scratch("round-trip") else { return };
         let original = fs::read(&path).unwrap();
 
-        let opened = open(&path).unwrap();
+        let mut opened = open(&path).unwrap();
         assert!(opened.annots.is_empty());
         let text = extract_text(&opened.doc, 0).unwrap();
         let quad = Quad::span(&text.glyphs[0].quad, &text.glyphs[3].quad);
@@ -370,7 +405,7 @@ mod tests {
             Annot { page: 0, color: [1.0, 0.89, 0.2], kind: AnnotKind::Highlight { quads: vec![quad] } },
             note("needs a citation"),
         ];
-        save(&path, opened.base_len, &annots).unwrap();
+        save(&path, opened.base_len, &annots, &mut opened.stamp).unwrap();
         drop(opened);
 
         let annotated = fs::read(&path).unwrap();
@@ -378,7 +413,7 @@ mod tests {
         assert_eq!(&annotated[..original.len()], &original[..]);
 
         // Reopening finds our annotations and the original length.
-        let reopened = open(&path).unwrap();
+        let mut reopened = open(&path).unwrap();
         assert_eq!(reopened.base_len, original.len());
         assert_eq!(reopened.annots.len(), 2);
         assert_eq!(reopened.annots[1].kind, annots[1].kind);
@@ -388,14 +423,13 @@ mod tests {
         }
 
         // Saving again replaces the update instead of stacking another one.
-        save(&path, reopened.base_len, &annots[..1]).unwrap();
-        drop(reopened);
+        save(&path, reopened.base_len, &annots[..1], &mut reopened.stamp).unwrap();
         let resaved = fs::read(&path).unwrap();
         assert!(resaved.len() < annotated.len());
         assert_eq!(open(&path).unwrap().annots.len(), 1);
 
         // Clearing restores the original bytes.
-        save(&path, original.len(), &[]).unwrap();
+        save(&path, original.len(), &[], &mut reopened.stamp).unwrap();
         assert_eq!(fs::read(&path).unwrap(), original);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -403,9 +437,9 @@ mod tests {
     #[test]
     fn other_viewers_show_non_ascii_notes() {
         let Some((dir, path)) = scratch("non-ascii") else { return };
-        let opened = open(&path).unwrap();
+        let mut opened = open(&path).unwrap();
         let text = "café “quoted” – naïve";
-        save(&path, opened.base_len, &[note(text)]).unwrap();
+        save(&path, opened.base_len, &[note(text)], &mut opened.stamp).unwrap();
         // Run the page with its annotations, as any viewer draws it.
         let full = PdfDocument::open(path.to_str().unwrap()).unwrap();
         let list = full.load_page(0).unwrap().to_display_list(true).unwrap();
@@ -428,8 +462,8 @@ mod tests {
         let (link, hard) = (dir.join("link.pdf"), dir.join("hard.pdf"));
         symlink(&path, &link).unwrap();
         fs::hard_link(&path, &hard).unwrap();
-        let opened = open(&link).unwrap();
-        save(&link, opened.base_len, &[note("x")]).unwrap();
+        let mut opened = open(&link).unwrap();
+        save(&link, opened.base_len, &[note("x")], &mut opened.stamp).unwrap();
         assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         let meta = fs::metadata(&path).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
@@ -437,8 +471,59 @@ mod tests {
         assert_eq!(open(&hard).unwrap().annots.len(), 1);
         // A read-only file is left alone.
         fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
-        assert!(save(&path, opened.base_len, &[]).is_err());
+        assert!(save(&path, opened.base_len, &[], &mut opened.stamp).is_err());
         assert_eq!(open(&path).unwrap().annots.len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Appends an update with an annotation, as another program would.
+    fn annotate_elsewhere(path: &Path) {
+        let path = path.to_str().unwrap();
+        let doc = PdfDocument::open(path).unwrap();
+        let mut page = doc.load_pdf_page(0).unwrap();
+        let mut an = page.create_annotation(PdfAnnotationType::Square).unwrap();
+        an.set_rect(mupdf::Rect::new(10.0, 10.0, 40.0, 40.0)).unwrap();
+        an.update().unwrap();
+        drop(page);
+        let mut opts = PdfWriteOptions::default();
+        opts.set_incremental(true);
+        doc.save_with_options(path, opts).unwrap();
+    }
+
+    #[test]
+    fn keeps_updates_appended_by_other_programs() {
+        let Some((dir, path)) = scratch("appended") else { return };
+        let mut opened = open(&path).unwrap();
+        save(&path, opened.base_len, &[note("first")], &mut opened.stamp).unwrap();
+        drop(opened);
+        annotate_elsewhere(&path);
+        let theirs = fs::read(&path).unwrap();
+
+        // The old ViDF annotations are part of the other program's revision now.
+        let mut opened = open(&path).unwrap();
+        assert!(opened.annots.is_empty());
+        assert_eq!(opened.base_len, theirs.len());
+        assert!(opened.warning.is_some());
+        save(&path, opened.base_len, &[note("second")], &mut opened.stamp).unwrap();
+        drop(opened);
+        assert_eq!(&fs::read(&path).unwrap()[..theirs.len()], &theirs[..]);
+        let mut opened = open(&path).unwrap();
+        assert_eq!(opened.annots, [note("second")]);
+        assert!(opened.warning.is_some());
+        save(&path, opened.base_len, &[], &mut opened.stamp).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), theirs);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_write_over_changes_made_while_open() {
+        let Some((dir, path)) = scratch("changed") else { return };
+        let mut opened = open(&path).unwrap();
+        annotate_elsewhere(&path);
+        let theirs = fs::read(&path).unwrap();
+        assert!(save(&path, opened.base_len, &[note("x")], &mut opened.stamp).is_err());
+        assert!(save(&path, opened.base_len, &[], &mut opened.stamp).is_err());
+        assert_eq!(fs::read(&path).unwrap(), theirs);
         fs::remove_dir_all(&dir).unwrap();
     }
 

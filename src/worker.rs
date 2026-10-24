@@ -62,6 +62,7 @@ fn run(path: PathBuf, rx: Receiver<Request>, send: impl Fn(Response) -> bool) {
     };
     let doc = opened.doc;
     let base_len = opened.base_len;
+    let mut stamp = opened.stamp;
     let mut texts: VecDeque<usize> = (0..opened.pages.len()).collect();
     if !send(Response::Opened { pages: opened.pages, annots: opened.annots, warning: opened.warning }) {
         return;
@@ -87,7 +88,7 @@ fn run(path: PathBuf, rx: Receiver<Request>, send: impl Fn(Response) -> bool) {
                 Request::Cancel { page } => renders.retain(|r| r.0 != page),
                 Request::Save { annots } => {
                     let n = annots.len();
-                    if !send(Response::Saved(pdf::save(&path, base_len, &annots).map(|()| n))) {
+                    if !send(Response::Saved(pdf::save(&path, base_len, &annots, &mut stamp).map(|()| n))) {
                         return;
                     }
                 }

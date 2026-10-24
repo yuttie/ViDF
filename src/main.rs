@@ -36,9 +36,9 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
     if clear {
-        let result = pdf::open(&path).and_then(|o| {
+        let result = pdf::open(&path).and_then(|mut o| {
             let n = o.annots.len();
-            pdf::save(&path, o.base_len, &[]).map(|()| n)
+            pdf::save(&path, o.base_len, &[], &mut o.stamp).map(|()| n)
         });
         return match result {
             Ok(n) => {
