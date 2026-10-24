@@ -592,31 +592,38 @@ impl Editor {
         }
     }
 
-    fn annot_anchor(a: &Annot) -> Vec2 {
-        match &a.kind {
-            AnnotKind::Highlight { quads } => quads.first().map_or(Vec2::ZERO, |q| (q.ul + q.ll) / 2.0),
-            AnnotKind::Note { at, size, .. } => *at - Vec2::new(-1.0, size / 2.0),
-        }
+    /// The glyph an annotation starts at: the first glyph of a highlight,
+    /// or the one a note hangs below.
+    fn annot_target(&self, a: &Annot) -> Option<Pos> {
+        let at = match &a.kind {
+            AnnotKind::Highlight { quads } => {
+                // Just inside the left edge, so not on the space before it.
+                let q = quads.first()?;
+                let along = q.ur - q.ul;
+                let inset = along.normalize_or_zero() * (along.length() / 2.0).min(0.5);
+                (q.ul + q.ll) / 2.0 + inset
+            }
+            AnnotKind::Note { at, .. } => *at + Vec2::new(0.5, -1.5),
+        };
+        self.text.glyph_at(a.page, at).or_else(|| self.text.nearest(a.page, at))
     }
 
+    /// Moves to the next or previous annotation in reading order.
     fn jump_annot(&mut self, forward: bool) {
-        let key = |page: usize, p: Vec2| (page, (p.y * 4.0) as i64, (p.x * 4.0) as i64);
-        let Some(g) = self.text.glyph(self.cursor) else { return };
-        let here = key(self.cursor.page, g.quad.center());
-        let mut order: Vec<_> = self.annots.iter().map(|a| (key(a.page, Self::annot_anchor(a)), a)).collect();
-        order.sort_by_key(|(k, _)| *k);
+        let mut targets: Vec<Pos> = self.annots.iter().filter_map(|a| self.annot_target(a)).collect();
+        targets.sort_unstable();
+        let c = self.cursor;
         let target = if forward {
-            order.iter().find(|(k, _)| *k > here).or(order.first())
+            targets.iter().find(|&&p| p > c).or(targets.first())
         } else {
-            order.iter().rev().find(|(k, _)| *k < here).or(order.last())
+            targets.iter().rev().find(|&&p| p < c).or(targets.last())
         };
-        let Some((_, a)) = target else {
-            self.message = "no annotations".into();
-            return;
-        };
-        if let Some(p) = self.text.nearest(a.page, Self::annot_anchor(a)) {
-            self.cursor = p;
-            self.follow_cursor();
+        match target {
+            Some(&p) => {
+                self.cursor = p;
+                self.follow_cursor();
+            }
+            None => self.message = "no annotations".into(),
         }
     }
 
@@ -869,6 +876,30 @@ mod tests {
         e
     }
 
+    /// One page with lines starting at the given points. Letters are 6pt
+    /// wide and spaces 3pt, like the spaces MuPDF puts between words.
+    fn editor_with(lines: &[(&str, f32, f32)]) -> Editor {
+        let mut e = Editor::default();
+        let page = PageInfo { size: Vec2::new(600.0, 800.0), origin: Vec2::ZERO };
+        e.open(vec![page], vec![], Vec2::new(624.0, 400.0));
+        let mut t = PageText::default();
+        for (li, &(s, mut x, y)) in lines.iter().enumerate() {
+            let glyphs: Vec<Glyph> = s
+                .chars()
+                .map(|c| {
+                    let w = if c == ' ' { 3.0 } else { 6.0 };
+                    let v = |x, y| Vec2::new(x, y);
+                    let quad = Quad { ul: v(x, y), ur: v(x + w, y), ll: v(x, y + 10.0), lr: v(x + w, y + 10.0) };
+                    x += w;
+                    Glyph { c, quad }
+                })
+                .collect();
+            t.push_line(li as u32, glyphs);
+        }
+        e.set_text(0, t);
+        e
+    }
+
     fn keys(e: &mut Editor, s: &str) -> Vec<Effect> {
         s.chars()
             .flat_map(|c| {
@@ -974,6 +1005,36 @@ mod tests {
         keys(&mut e, "vea");
         assert!(!e.may_close());
         assert!(e.status().0.starts_with("unsaved annotations"));
+    }
+
+    #[test]
+    fn annotation_jumps_land_on_the_annotation() {
+        let mut e = editor_with(&[("alpha beta gamma", 50.0, 100.0), ("delta epsilon", 50.0, 112.0)]);
+        // Highlight "beta", "gamma" and "delta", which starts a line.
+        keys(&mut e, "wveawveaj0vea");
+        assert_eq!(e.annots.len(), 3);
+        keys(&mut e, "gg]a");
+        assert_eq!(e.cursor.idx, 6);
+        keys(&mut e, "]a");
+        assert_eq!(e.cursor.idx, 11);
+        keys(&mut e, "]a");
+        assert_eq!(e.cursor.idx, 16);
+        keys(&mut e, "[a");
+        assert_eq!(e.cursor.idx, 11);
+        keys(&mut e, "[a[a");
+        assert_eq!(e.cursor.idx, 16);
+        keys(&mut e, "x");
+        assert_eq!(e.annots.len(), 2);
+    }
+
+    #[test]
+    fn annotation_jumps_follow_reading_order() {
+        let mut e = editor_with(&[("left top", 50.0, 100.0), ("left lower", 50.0, 500.0), ("right top", 300.0, 100.0)]);
+        keys(&mut e, "/right\nvea/lower\nvea");
+        keys(&mut e, "gg]a");
+        assert_eq!(e.cursor.idx, 13);
+        keys(&mut e, "]a");
+        assert_eq!(e.cursor.idx, 18);
     }
 
     #[test]

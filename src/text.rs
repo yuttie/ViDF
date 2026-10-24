@@ -328,6 +328,15 @@ impl DocText {
         Some(self.closest_in_line(page, line, at.x))
     }
 
+    /// The glyph whose box contains `at` on `page`, the nearest one to its
+    /// centre if several do.
+    pub fn glyph_at(&self, page: usize, at: Vec2) -> Option<Pos> {
+        let t = self.page(page)?;
+        let hits = t.glyphs.iter().enumerate().filter(|(_, g)| g.quad.bbox().contains(at));
+        let (idx, _) = hits.min_by(|a, b| (a.1.quad.center() - at).length().total_cmp(&(b.1.quad.center() - at).length()))?;
+        Some(Pos { page, idx })
+    }
+
     /// Calls `f` with the glyph range of every line piece covered by `a..=b`.
     fn for_line_pieces(&self, a: Pos, b: Pos, mut f: impl FnMut(usize, &PageText, usize, usize)) {
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
