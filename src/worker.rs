@@ -21,7 +21,8 @@ pub enum Response {
     Opened { pages: Vec<PageInfo>, annots: Vec<Annot>, warning: Option<String> },
     Text { page: usize, text: PageText },
     Rendered { page: usize, scale: f32, width: u32, height: u32, rgba: Vec<u8> },
-    Saved(Result<usize, String>),
+    /// The annotations written.
+    Saved(Result<Vec<Annot>, String>),
     Failed(String),
 }
 
@@ -87,8 +88,7 @@ fn run(path: PathBuf, rx: Receiver<Request>, send: impl Fn(Response) -> bool) {
                 }
                 Request::Cancel { page } => renders.retain(|r| r.0 != page),
                 Request::Save { annots } => {
-                    let n = annots.len();
-                    if !send(Response::Saved(pdf::save(&path, base_len, &annots, &mut stamp).map(|()| n))) {
+                    if !send(Response::Saved(pdf::save(&path, base_len, &annots, &mut stamp).map(|()| annots))) {
                         return;
                     }
                 }

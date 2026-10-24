@@ -72,7 +72,7 @@ pub struct Editor {
     pub color: usize,
     pub message: String,
     last_search: Option<(String, bool)>,
-    pub quit_after_save: bool,
+    quit_after_save: bool,
     /// Bumped whenever what is drawn over the pages changes.
     pub generation: u64,
 }
@@ -111,13 +111,32 @@ impl Editor {
         self.annots != self.saved
     }
 
-    pub fn saved(&mut self, n: usize) {
-        self.saved = self.annots.clone();
+    /// Takes the outcome of an `Effect::Save`: the annotations written,
+    /// which may differ from the current ones by now.
+    pub fn saved(&mut self, result: Result<Vec<Annot>, String>) -> Vec<Effect> {
+        let quit = std::mem::take(&mut self.quit_after_save);
+        let written = match result {
+            Ok(written) => written,
+            Err(e) => {
+                self.message = format!("write failed: {e}");
+                return Vec::new();
+            }
+        };
+        let n = written.len();
         self.message = if n == 0 {
             "written: original PDF restored".into()
         } else {
             format!("written: {n} annotation{}", if n == 1 { "" } else { "s" })
         };
+        self.saved = written;
+        if !quit {
+            Vec::new()
+        } else if self.dirty() {
+            self.message = "not quitting: annotations changed while writing".into();
+            Vec::new()
+        } else {
+            vec![Effect::Quit]
+        }
     }
 
     fn changed(&mut self) {
@@ -905,6 +924,21 @@ mod tests {
         assert_eq!(e.cursor, Pos { page: 1, idx: 22 });
         let fx = keys(&mut e, "ggvjy");
         assert_eq!(fx, vec![Effect::Yank("alpha beta gamma d".into())]);
+    }
+
+    #[test]
+    fn changes_made_while_writing_stay_unsaved() {
+        let mut e = editor();
+        keys(&mut e, "vea");
+        assert_eq!(keys(&mut e, "ZZ"), vec![Effect::Save]);
+        let written = e.annots.clone();
+        keys(&mut e, "w\"rihi\x1b");
+        assert!(e.saved(Ok(written)).is_empty());
+        assert!(e.dirty());
+        assert!(keys(&mut e, ":q\n").is_empty());
+        assert_eq!(keys(&mut e, ":wq\n"), vec![Effect::Save]);
+        assert_eq!(e.saved(Ok(e.annots.clone())), vec![Effect::Quit]);
+        assert!(!e.dirty());
     }
 
     #[test]

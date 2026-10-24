@@ -143,15 +143,9 @@ impl Viewer {
                     let tex = ctx.load_texture(format!("page-{page}"), image, TextureOptions::LINEAR);
                     pt.shown = Some((tex, scale));
                 }
-                Response::Saved(Ok(n)) => {
-                    self.ed.saved(n);
-                    if self.ed.quit_after_save {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                }
-                Response::Saved(Err(e)) => {
-                    self.ed.quit_after_save = false;
-                    self.ed.message = format!("write failed: {e}");
+                Response::Saved(result) => {
+                    let fx = self.ed.saved(result);
+                    self.apply(ctx, fx);
                 }
                 Response::Failed(e) if !self.opened => {
                     *self.failure.lock().unwrap() = Some(e);
@@ -163,7 +157,12 @@ impl Viewer {
     }
 
     fn press(&mut self, ctx: &egui::Context, k: Key) {
-        for fx in self.ed.key(k) {
+        let fx = self.ed.key(k);
+        self.apply(ctx, fx);
+    }
+
+    fn apply(&mut self, ctx: &egui::Context, effects: Vec<Effect>) {
+        for fx in effects {
             match fx {
                 Effect::Save => {
                     let annots = self.ed.annots.clone();
