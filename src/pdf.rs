@@ -68,9 +68,8 @@ impl Stamp {
 /// stored in files.
 fn hash(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325_u64;
-    let words = bytes.chunks_exact(8);
-    let rest = words.remainder();
-    for w in words.map(|w| u64::from_le_bytes(w.try_into().unwrap())).chain(rest.iter().map(|&b| u64::from(b))) {
+    let (words, rest) = bytes.as_chunks::<8>();
+    for w in words.iter().map(|&w| u64::from_le_bytes(w)).chain(rest.iter().map(|&b| u64::from(b))) {
         h = (h ^ w).wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
