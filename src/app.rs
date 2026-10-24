@@ -118,6 +118,19 @@ fn convert_key(key: EguiKey, ctrl: bool) -> Option<Key> {
     })
 }
 
+/// Where to draw a page texture of `size` texels rendered at `scale`
+/// pixels per point over the page's `rect`. At the current zoom, `current`
+/// pixels per point, it goes at whole physical pixels with one texel per
+/// pixel, which keeps text sharp; otherwise it is stretched over `rect`
+/// until the page is rendered again.
+fn page_image_rect(rect: egui::Rect, size: [usize; 2], scale: f32, current: f32, ppp: f32) -> egui::Rect {
+    if (scale / current - 1.0).abs() > 1e-4 {
+        return rect;
+    }
+    let min = (rect.min.to_vec2() * ppp).round() / ppp;
+    egui::Rect::from_min_size(min.to_pos2(), egui::vec2(size[0] as f32, size[1] as f32) / ppp)
+}
+
 fn color(c: [f32; 4]) -> Color32 {
     let [r, g, b, a] = c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
     Color32::from_rgba_unmultiplied(r, g, b, a)
@@ -241,7 +254,7 @@ impl Viewer {
         }
     }
 
-    fn draw_pages(&self, painter: &egui::Painter, area: egui::Rect) {
+    fn draw_pages(&self, painter: &egui::Painter, area: egui::Rect, ppp: f32) {
         let view = &self.ed.view;
         let center = view.center;
         let to_screen = |w: Vec2| area.center() + egui::vec2(w.x - center.x, center.y - w.y);
@@ -252,9 +265,10 @@ impl Viewer {
                 continue;
             }
             match &pt.shown {
-                Some((tex, _)) => {
+                Some((tex, scale)) => {
                     let uv = egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-                    painter.image(tex.id(), rect, uv, Color32::WHITE);
+                    let at = page_image_rect(rect, tex.size(), *scale, view.zoom * ppp, ppp);
+                    painter.image(tex.id(), at, uv, Color32::WHITE);
                 }
                 None => {
                     painter.rect_filled(rect, 0.0, Color32::WHITE);
@@ -328,9 +342,23 @@ impl eframe::App for Viewer {
                 self.ed.view.size = size;
                 self.ed.view.scroll(Vec2::ZERO);
             }
-            self.draw_pages(&ui.painter_at(area), area);
+            self.draw_pages(&ui.painter_at(area), area, ui.ctx().pixels_per_point());
         });
         self.request_renders(ctx.pixels_per_point());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_images_snap_to_pixels() {
+        let rect = egui::Rect::from_min_size(Pos2::new(25.32, 10.7), egui::vec2(100.4, 200.3));
+        let at = page_image_rect(rect, [201, 401], 2.0, 2.0, 2.0);
+        assert_eq!(at, egui::Rect::from_min_size(Pos2::new(25.5, 10.5), egui::vec2(100.5, 200.5)));
+        // A texture from before a zoom is stretched over the page.
+        assert_eq!(page_image_rect(rect, [201, 401], 2.0, 2.2, 2.0), rect);
     }
 }
 
