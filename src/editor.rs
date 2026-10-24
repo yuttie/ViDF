@@ -305,6 +305,17 @@ impl Editor {
         }
     }
 
+    /// Adds a typed digit to the count; `0` alone is a motion.
+    fn count_digit(&mut self, k: Key) -> bool {
+        let Key::Char(d @ '0'..='9') = k else { return false };
+        if d == '0' && self.count.is_none() {
+            return false;
+        }
+        let v = self.count.unwrap_or(0).saturating_mul(10).saturating_add(d as usize - '0' as usize);
+        self.count = Some(v.min(100_000));
+        true
+    }
+
     fn normal(&mut self, k: Key, fx: &mut Vec<Effect>) {
         if !self.pending.is_empty() {
             let p = std::mem::take(&mut self.pending);
@@ -312,12 +323,8 @@ impl Editor {
             self.count = None;
             return;
         }
-        if let Key::Char(d @ '0'..='9') = k {
-            if d != '0' || self.count.is_some() {
-                let v = self.count.unwrap_or(0).saturating_mul(10).saturating_add(d as usize - '0' as usize);
-                self.count = Some(v.min(100_000));
-                return;
-            }
+        if self.count_digit(k) {
+            return;
         }
         if self.motion(k) {
             return;
@@ -430,11 +437,8 @@ impl Editor {
     }
 
     fn visual(&mut self, k: Key, fx: &mut Vec<Effect>) {
-        if let Key::Char(d @ '0'..='9') = k {
-            if d != '0' || self.count.is_some() {
-                self.count = Some(self.count.unwrap_or(0) * 10 + (d as usize - '0' as usize));
-                return;
-            }
+        if self.count_digit(k) {
+            return;
         }
         if !self.pending.is_empty() {
             let p = std::mem::take(&mut self.pending);
@@ -969,6 +973,13 @@ mod tests {
         keys(&mut e, "vea");
         assert!(!e.may_close());
         assert!(e.status().0.starts_with("unsaved annotations"));
+    }
+
+    #[test]
+    fn visual_counts_are_capped() {
+        let mut e = editor();
+        keys(&mut e, &format!("v{}w", "9".repeat(25)));
+        assert_eq!(e.cursor, e.text.last_until(usize::MAX).unwrap());
     }
 
     #[test]
