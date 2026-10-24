@@ -28,6 +28,7 @@ const NAME_PREFIX: &str = "vidf-";
 const AUTHOR: &str = "ViDF";
 const NOTE_FONT: &str = "Helv";
 const NOTE_FILL: [f32; 3] = [1.0, 1.0, 0.97];
+const DAMAGED: &str = "this PDF is damaged and cannot be annotated without rewriting it";
 
 #[derive(Clone, Copy, Debug)]
 pub struct PageInfo {
@@ -269,10 +270,10 @@ impl Drop for TempFile {
 fn with_annots(base: &[u8], annots: &[Annot]) -> Result<Vec<u8>, String> {
     let doc = PdfDocument::from_bytes(base).map_err(err)?;
     if !doc.can_be_saved_incrementally() {
-        return Err("this PDF is damaged and cannot be annotated without rewriting it".into());
+        return Err(DAMAGED.into());
     }
     let base_len = base.len();
-    let base = PdfObject::new_int(i32::try_from(base_len).map_err(err)?).map_err(err)?;
+    let base_obj = PdfObject::new_int(i32::try_from(base_len).map_err(err)?).map_err(err)?;
     let mut pages = std::collections::HashMap::new();
     for (i, a) in annots.iter().enumerate() {
         if !pages.contains_key(&a.page) {
@@ -301,7 +302,7 @@ fn with_annots(base: &[u8], annots: &[Annot]) -> Result<Vec<u8>, String> {
         an.set_author(AUTHOR).map_err(err)?;
         let mut obj = an.object();
         obj.dict_put("NM", PdfObject::new_string(&format!("{NAME_PREFIX}{i}")).map_err(err)?).map_err(err)?;
-        obj.dict_put(BASE_KEY, base.try_clone().map_err(err)?).map_err(err)?;
+        obj.dict_put(BASE_KEY, base_obj.try_clone().map_err(err)?).map_err(err)?;
         if !an.update().map_err(err)? {
             return Err(format!("could not create the appearance of annotation {}", i + 1));
         }
@@ -314,7 +315,17 @@ fn with_annots(base: &[u8], annots: &[Annot]) -> Result<Vec<u8>, String> {
     let mut opts = PdfWriteOptions::default();
     opts.set_incremental(true);
     doc.save_with_options(tmp.0.to_str().ok_or("non UTF-8 temporary directory")?, opts).map_err(err)?;
-    fs::read(&tmp.0).map_err(err)
+    let out = fs::read(&tmp.0).map_err(err)?;
+    // Saving loads every object, and if one is damaged MuPDF repairs the
+    // file and drops the annotations without an error.
+    let written = out.len() > base_len
+        && out[..base_len] == *base
+        && own_update(&PdfDocument::from_bytes(&out).map_err(err)?, &out)
+            .is_ok_and(|(len, own, _)| len == base_len && own.len() == annots.len());
+    if !written || !doc.can_be_saved_incrementally() {
+        return Err(DAMAGED.into());
+    }
+    Ok(out)
 }
 
 /// Replaces everything in `file` after `at` by `tail`. The bytes before
@@ -371,14 +382,19 @@ mod tests {
         p.exists().then_some(p)
     }
 
+    fn test_dir(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vidf-test-{}-{test}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     /// A copy of the sample PDF in a directory of its own.
     fn scratch(test: &str) -> Option<(PathBuf, PathBuf)> {
         let Some(src) = sample() else {
             eprintln!("no sample PDF; skipping");
             return None;
         };
-        let dir = std::env::temp_dir().join(format!("vidf-test-{}-{test}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir(test);
         let path = dir.join("paper.pdf");
         fs::copy(&src, &path).unwrap();
         Some((dir, path))
@@ -524,6 +540,53 @@ mod tests {
         assert!(save(&path, opened.base_len, &[note("x")], &mut opened.stamp).is_err());
         assert!(save(&path, opened.base_len, &[], &mut opened.stamp).is_err());
         assert_eq!(fs::read(&path).unwrap(), theirs);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A one-page PDF with a classic xref table whose entry for the info
+    /// dictionary is off by `skew` bytes. MuPDF only notices that when it
+    /// loads every object, which it does while saving.
+    fn classic_pdf(skew: usize) -> Vec<u8> {
+        let content = "BT /F1 12 Tf 20 100 Td (Hello reviewers) Tj ET";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R \
+             /Resources << /Font << /F1 5 0 R >> >> >>"
+                .into(),
+            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            "<< /Title (sample) >>".into(),
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, o) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend(format!("{} 0 obj\n{o}\nendobj\n", i + 1).bytes());
+        }
+        offsets[5] += skew;
+        let xref = out.len();
+        out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).bytes());
+        for off in offsets {
+            out.extend(format!("{off:010} 00000 n \n").bytes());
+        }
+        let n = objects.len() + 1;
+        out.extend(format!("trailer\n<< /Size {n} /Root 1 0 R /Info 6 0 R >>\nstartxref\n{xref}\n%%EOF\n").bytes());
+        out
+    }
+
+    #[test]
+    fn reports_damaged_files_it_cannot_annotate() {
+        let dir = test_dir("damaged");
+        let path = dir.join("paper.pdf");
+        for (skew, ok) in [(0, true), (7, false)] {
+            fs::write(&path, classic_pdf(skew)).unwrap();
+            let mut opened = open(&path).unwrap();
+            assert_eq!(save(&path, opened.base_len, &[note("x")], &mut opened.stamp).is_ok(), ok);
+            if !ok {
+                assert_eq!(fs::read(&path).unwrap(), classic_pdf(skew));
+            }
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
