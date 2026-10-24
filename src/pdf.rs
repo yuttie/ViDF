@@ -2,14 +2,13 @@
 //! storing annotations.
 //!
 //! Annotations are never merged into the original bytes. They are appended
-//! as one incremental update, and each of them records the length of the
-//! file before that update (`/ViDFBase`). Writing again replaces everything
-//! after that length in place, so the file is always "original bytes + at
-//! most one ViDF update",
-//! and clearing all annotations restores the original byte for byte.
+//! as one incremental update, and each of them records the length and the
+//! hash of the file before that update (`/ViDFBase`, `/ViDFHash`). Writing
+//! again replaces everything after that length in place, so the file is
+//! always "original bytes + at most one ViDF update", and clearing all
+//! annotations restores the original byte for byte.
 
 use std::fs::{self, File, OpenOptions};
-use std::hash::{DefaultHasher, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -24,6 +23,7 @@ use crate::annot::{note_rect, Annot, AnnotKind};
 use crate::text::{Glyph, PageText, Quad};
 
 const BASE_KEY: &str = "ViDFBase";
+const HASH_KEY: &str = "ViDFHash";
 const NAME_PREFIX: &str = "vidf-";
 const AUTHOR: &str = "ViDF";
 const NOTE_FONT: &str = "Helv";
@@ -60,10 +60,28 @@ pub struct Stamp {
 
 impl Stamp {
     fn of(bytes: &[u8]) -> Stamp {
-        let mut h = DefaultHasher::new();
-        h.write(bytes);
-        Stamp { len: bytes.len(), hash: h.finish() }
+        Stamp { len: bytes.len(), hash: hash(bytes) }
     }
+}
+
+/// FNV-1a over 64-bit words: fast, and stable across builds, since it is
+/// stored in files.
+fn hash(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    let words = bytes.chunks_exact(8);
+    let rest = words.remainder();
+    for w in words.map(|w| u64::from_le_bytes(w.try_into().unwrap())).chain(rest.iter().map(|&b| u64::from(b))) {
+        h = (h ^ w).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// What a ViDF annotation records about the original part of the file:
+/// its length and, since that part need not end in `%%EOF`, its hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Base {
+    len: i32,
+    hash: Option<u64>,
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -117,8 +135,8 @@ fn is_ours(annot: &mupdf::pdf::PdfAnnotation) -> bool {
     name.is_some_and(|n| n.starts_with(NAME_PREFIX))
 }
 
-/// ViDF annotations, each with the `/ViDFBase` it records.
-fn load_annots(doc: &PdfDocument) -> Result<Vec<(Option<i32>, Annot)>, String> {
+/// ViDF annotations, each with the base it records.
+fn load_annots(doc: &PdfDocument) -> Result<Vec<(Option<Base>, Annot)>, String> {
     let mut out = Vec::new();
     for page in 0..doc.page_count().map_err(err)? {
         let p = doc.load_pdf_page(page).map_err(err)?;
@@ -126,7 +144,11 @@ fn load_annots(doc: &PdfDocument) -> Result<Vec<(Option<i32>, Annot)>, String> {
             if !is_ours(&a) {
                 continue;
             }
-            let base = a.object().get_dict(BASE_KEY).map_err(err)?.map(|v| v.as_int()).transpose().map_err(err)?;
+            let obj = a.object();
+            let len = obj.get_dict(BASE_KEY).map_err(err)?.map(|v| v.as_int()).transpose().map_err(err)?;
+            let digest = obj.get_dict(HASH_KEY).ok().flatten();
+            let hash = digest.and_then(|v| u64::from_str_radix(&v.as_string().ok()?, 16).ok());
+            let base = len.map(|len| Base { len, hash });
             let page = page as usize;
             match a.r#type().map_err(err)? {
                 PdfAnnotationType::Highlight => {
@@ -157,10 +179,13 @@ fn load_annots(doc: &PdfDocument) -> Result<Vec<(Option<i32>, Annot)>, String> {
 fn own_update(full: &PdfDocument, bytes: &[u8]) -> Result<(usize, Vec<Annot>, usize), String> {
     let found = load_annots(full)?;
     let latest = found.iter().filter_map(|f| f.0).max();
-    let base_len = match latest.map(usize::try_from) {
-        Some(Ok(len)) if len > 0 && len < bytes.len() && ends_with_eof(&bytes[..len]) && is_last_update(full, len) => len,
-        _ => return Ok((bytes.len(), Vec::new(), found.len())),
+    let intact = |base: Base| {
+        let len = usize::try_from(base.len).ok().filter(|&len| len > 0 && len < bytes.len())?;
+        // Updates saved before the hash was recorded only had the length.
+        let same = base.hash.map_or_else(|| ends_with_eof(&bytes[..len]), |h| h == hash(&bytes[..len]));
+        (same && is_last_update(full, len)).then_some(len)
     };
+    let Some(base_len) = latest.and_then(intact) else { return Ok((bytes.len(), Vec::new(), found.len())) };
     let (own, stale): (Vec<_>, Vec<_>) = found.into_iter().partition(|f| f.0 == latest);
     Ok((base_len, own.into_iter().map(|f| f.1).collect(), stale.len()))
 }
@@ -297,6 +322,7 @@ fn with_annots(base: &[u8], annots: &[Annot]) -> Result<Vec<u8>, String> {
     }
     let base_len = base.len();
     let base_obj = PdfObject::new_int(i32::try_from(base_len).map_err(err)?).map_err(err)?;
+    let hash_obj = PdfObject::new_string(&format!("{:016x}", hash(base))).map_err(err)?;
     let mut pages = std::collections::HashMap::new();
     for (i, a) in annots.iter().enumerate() {
         if !pages.contains_key(&a.page) {
@@ -326,6 +352,7 @@ fn with_annots(base: &[u8], annots: &[Annot]) -> Result<Vec<u8>, String> {
         let mut obj = an.object();
         obj.dict_put("NM", PdfObject::new_string(&format!("{NAME_PREFIX}{i}")).map_err(err)?).map_err(err)?;
         obj.dict_put(BASE_KEY, base_obj.try_clone().map_err(err)?).map_err(err)?;
+        obj.dict_put(HASH_KEY, hash_obj.try_clone().map_err(err)?).map_err(err)?;
         if !an.update().map_err(err)? {
             return Err(format!("could not create the appearance of annotation {}", i + 1));
         }
@@ -652,6 +679,23 @@ mod tests {
         let (head, tail) = pdf.rsplit_once("startxref\n").unwrap();
         fs::write(&path, format!("{head}startxref\n1{tail}")).unwrap();
         assert!(open(&path).unwrap().warning.is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn annotates_files_with_junk_at_the_end() {
+        let dir = test_dir("junk");
+        let path = dir.join("paper.pdf");
+        let mut original = classic_pdf(0);
+        original.extend(b"<html>junk</html>\n");
+        fs::write(&path, &original).unwrap();
+        let mut opened = open(&path).unwrap();
+        assert!(opened.warning.is_none());
+        save(&path, opened.base_len, &[note("x")], &mut opened.stamp).unwrap();
+        let opened = open(&path).unwrap();
+        assert_eq!((opened.base_len, opened.annots.len()), (original.len(), 1));
+        assert_eq!(clear(&path).unwrap(), (1, None));
+        assert_eq!(fs::read(&path).unwrap(), original);
         fs::remove_dir_all(&dir).unwrap();
     }
 
